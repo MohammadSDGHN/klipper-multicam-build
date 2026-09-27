@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Klipper MultiCam v8 built-in MJPEG preview + stability patch for FreeTracker/AndroidUVC.
+Klipper MultiCam v9 dedicated-appliance patch for FreeTracker/AndroidUVC.
 
 Adds:
 - auto-start USB UVC streams
@@ -23,13 +23,18 @@ repo = Path(sys.argv[1] if len(sys.argv) > 1 else "AndroidUVC")
 main_path = repo / "app/src/main/java/net/d7z/net/oss/uvc/MainActivity.kt"
 svc_path = repo / "app/src/main/java/net/d7z/net/oss/uvc/UvcStreamingService.kt"
 assets_dir = repo / "app/src/main/assets"
+manifest_path = repo / "app/src/main/AndroidManifest.xml"
+package_dir = repo / "app/src/main/java/net/d7z/net/oss/uvc"
+boot_receiver_path = package_dir / "KioskBootReceiver.kt"
+crash_handler_path = package_dir / "KioskCrashHandler.kt"
 
-for p in (main_path, svc_path):
+for p in (main_path, svc_path, manifest_path):
     if not p.exists():
         raise SystemExit(f"Required source file not found: {p}")
 
 main = main_path.read_text(encoding="utf-8")
 svc = svc_path.read_text(encoding="utf-8")
+manifest = manifest_path.read_text(encoding="utf-8")
 svc_original_line_count = len(svc.splitlines())
 
 
@@ -79,7 +84,7 @@ main = replace_once(
     main,
     "            mainHandler.postDelayed({ refreshDeviceList() }, 300)",
     """            mainHandler.postDelayed({ refreshDeviceList() }, 300)
-            mainHandler.postDelayed({ startAllStreaming() }, 1500)""",
+            mainHandler.postDelayed({ uvcService?.restoreDesiredStreams() }, 1500)""",
     "MainActivity initial auto-start",
 )
 
@@ -87,7 +92,7 @@ main = replace_once(
     main,
     "        service.onSessionCreatedListener = { session ->\n            runOnUiThread {",
     """        service.onSessionCreatedListener = { session ->
-            mainHandler.postDelayed({ startAllStreaming() }, 700)
+            mainHandler.postDelayed({ service.restoreDesiredUvc(session) }, 700)
             runOnUiThread {""",
     "MainActivity session-created auto-start",
 )
@@ -1374,7 +1379,7 @@ dashboard = r'''    private fun rootPage(): String {
                 <footer>
                   <span>${esc(camera.actualEncoding.ifBlank { "Camera2" })}</span>
                   <button onclick="takePhoto('tile-phone','phone')">Photo</button>
-                  ${if (streamUrl.isNotBlank()) "<button onclick=\"openUrl('$streamUrl')\">Open TS</button>" else ""}
+                  ${if (camera.isStreaming && camera.browserPreviewReader != null) "<button onclick=\"openUrl('/builtin/${camera.key}.mjpg')\">Open MJPEG</button>" else ""}
                 </footer>
               </section>
             """.trimIndent()
@@ -1465,6 +1470,364 @@ else:
         block += "\n        private const val BROWSER_MJPEG_MAX_FPS = 10\n        private const val BROWSER_JPEG_QUALITY = 78"
     svc = svc[:match.start()] + block + match.group(2) + svc[match.end():]
 
+
+# ---------------------------------------------------------------------------
+# v9 dedicated-appliance behaviour
+# ---------------------------------------------------------------------------
+
+main = replace_once(
+    main,
+    """        super.onCreate(savedInstanceState)
+        syncPersistedSettings()""",
+    """        super.onCreate(savedInstanceState)
+        KioskCrashHandler.install(this)
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
+        syncPersistedSettings()""",
+    "Dedicated always-on MainActivity",
+)
+
+main = replace_once(
+    main,
+    """                service.persistBuiltInSettings(key)
+                service.stopBuiltInCamera(key) {""",
+    """                service.persistBuiltInSettings(key)
+                service.setBuiltInAutoStart(key, false)
+                service.stopBuiltInCamera(key) {""",
+    "Remember built-in stop state",
+)
+
+main = replace_once(
+    main,
+    """                if (!prepareBuiltInStartSettings(session, customResolutionText, customFpsText)) return
+                service.startBuiltInCamera(key) {""",
+    """                if (!prepareBuiltInStartSettings(session, customResolutionText, customFpsText)) return
+                service.setBuiltInAutoStart(key, true)
+                service.startBuiltInCamera(key) {""",
+    "Remember built-in start state",
+)
+
+main = replace_once(
+    main,
+    """            service.persistBuiltInSettings(session.key)
+            service.stopBuiltInCamera(session.key) { finishBulkStop(--remaining) }""",
+    """            service.persistBuiltInSettings(session.key)
+            service.setBuiltInAutoStart(session.key, false)
+            service.stopBuiltInCamera(session.key) { finishBulkStop(--remaining) }""",
+    "Remember bulk built-in stop state",
+)
+
+dedicated_helpers = r"""
+    private data class DedicatedUvcMode(
+        val display: String,
+        val format: String,
+        val width: Int,
+        val height: Int,
+        val fpsValues: List<Int>
+    )
+
+    private fun dedicatedUvcModes(session: CameraSession): List<DedicatedUvcMode> {
+        return session.supportedFormats.split(";").mapNotNull { rawEntry ->
+            val entry = rawEntry.trim()
+            if (entry.isBlank()) return@mapNotNull null
+            val parts = entry.split(":")
+            if (parts.size < 2) return@mapNotNull null
+            val left = parts[0].trim().split("|", limit = 2)
+            val format = if (left.size == 2) left[0].trim() else "MJPG"
+            val resolution = if (left.size == 2) left[1].trim() else left[0].trim()
+            val width = resolution.substringBefore("x", "").toIntOrNull() ?: return@mapNotNull null
+            val height = resolution.substringAfter("x", "").toIntOrNull() ?: return@mapNotNull null
+            val fps = parts[1].split(",").mapNotNull { it.trim().toIntOrNull() }.distinct()
+            if (fps.isEmpty()) return@mapNotNull null
+            DedicatedUvcMode("$format ${width}x$height", format, width, height, fps)
+        }
+    }
+
+    private fun dedicatedUvcPrefBase(session: CameraSession): String {
+        val serial = runCatching { session.device.serialNumber }.getOrNull().orEmpty()
+        val identity = if (serial.isNotBlank()) serial else (session.device.productName ?: "camera")
+        return "dedicated.uvc.${session.device.vendorId}.${session.device.productId}.$identity"
+    }
+
+    private fun rememberUvcStart(
+        session: CameraSession,
+        width: Int,
+        height: Int,
+        fps: Int,
+        format: String,
+        active: Boolean = true
+    ) {
+        val base = dedicatedUvcPrefBase(session)
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit {
+            putBoolean("$base.active", active)
+            putInt("$base.width", width)
+            putInt("$base.height", height)
+            putInt("$base.fps", fps)
+            putString("$base.format", format)
+        }
+    }
+
+    private fun setUvcDesiredActive(session: CameraSession, active: Boolean) {
+        val base = dedicatedUvcPrefBase(session)
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit {
+            putBoolean("$base.active", active)
+        }
+    }
+
+    fun restoreDesiredUvc(session: CameraSession) {
+        if (session.state != SessionState.IDLE) return
+        val modes = dedicatedUvcModes(session)
+        if (modes.isEmpty()) return
+
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val base = dedicatedUvcPrefBase(session)
+        if (!prefs.getBoolean("$base.active", true)) return
+
+        val savedWidth = prefs.getInt("$base.width", -1)
+        val savedHeight = prefs.getInt("$base.height", -1)
+        val savedFormat = prefs.getString("$base.format", null)
+        val savedFps = prefs.getInt("$base.fps", -1)
+
+        val modeIndex = modes.indexOfFirst {
+            it.width == savedWidth && it.height == savedHeight && it.format == savedFormat
+        }.takeIf { it >= 0 } ?: session.selectedResPos.coerceIn(0, modes.lastIndex)
+
+        val mode = modes[modeIndex]
+        val fpsIndex = mode.fpsValues.indexOf(savedFps).takeIf { it >= 0 }
+            ?: session.selectedFpsPos.coerceIn(0, mode.fpsValues.lastIndex)
+        val fps = mode.fpsValues[fpsIndex]
+
+        session.selectedResPos = modeIndex
+        session.selectedFpsPos = fpsIndex
+        log("Dedicated restore USB ${session.index}: ${mode.display} @ ${fps}fps")
+        startStreaming(session.fd, mode.width, mode.height, fps, mode.format)
+    }
+
+    fun setBuiltInAutoStart(key: String, enabled: Boolean) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit {
+            if (enabled) {
+                builtInSessions.keys.forEach { other ->
+                    putBoolean("dedicated.builtin.$other.active", other == key)
+                }
+            } else {
+                putBoolean("dedicated.builtin.$key.active", false)
+            }
+        }
+    }
+
+    private fun restoreDesiredBuiltIn() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val target = builtInSessions.values.sortedBy { it.index }.firstOrNull {
+            prefs.getBoolean("dedicated.builtin.${it.key}.active", false)
+        } ?: return
+        if (target.state == SessionState.IDLE) {
+            log("Dedicated restore built-in: ${target.displayName}")
+            startBuiltInCamera(target.key)
+        }
+    }
+
+    fun restoreDesiredStreams() {
+        sessionsByIndex.values.sortedBy { it.index }.forEach { restoreDesiredUvc(it) }
+        serviceHandler.postDelayed({ restoreDesiredBuiltIn() }, 1200L)
+    }
+
+    fun builtInConcurrencySummary(): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return "unsupported API"
+        val manager = getSystemService(CameraManager::class.java)
+        val sets = runCatching { manager.concurrentCameraIds }.getOrElse { emptySet() }
+        if (sets.isEmpty()) return "NO (HAL reports no concurrent sets)"
+        return sets.joinToString(" ; ") { group -> group.sorted().joinToString("+") }
+    }
+
+"""
+
+svc = replace_once(
+    svc,
+    "    fun startStreaming(\n",
+    dedicated_helpers + "    fun startStreaming(\n",
+    "Dedicated persisted stream helpers",
+)
+
+svc = replace_once(
+    svc,
+    """            updateStatsAndNotificationAsync()
+            log(if (started) "Cam ${activeSession.index} streaming started." else "FAIL: Cam ${activeSession.index} failed to start streaming.")""",
+    """            if (started) {
+                rememberUvcStart(activeSession, width, height, fps, format, true)
+            }
+            updateStatsAndNotificationAsync()
+            log(if (started) "Cam ${activeSession.index} streaming started." else "FAIL: Cam ${activeSession.index} failed to start streaming.")""",
+    "Persist successful USB stream mode",
+)
+
+svc = replace_once(
+    svc,
+    """        Thread {
+            val session = sessionsByFd[fd] ?: return@Thread
+            val didStop = synchronized(session.stateLock) {""",
+    """        Thread {
+            val session = sessionsByFd[fd] ?: return@Thread
+            setUvcDesiredActive(session, false)
+            val didStop = synchronized(session.stateLock) {""",
+    "Persist explicit USB stop",
+)
+
+svc = replace_once(
+    svc,
+    """        onSessionsChangedListener?.invoke()
+    }
+    fun resetBuiltInResolutionAndFps(key: String) {""",
+    """        persistBuiltInSettings(key)
+        onSessionsChangedListener?.invoke()
+    }
+    fun resetBuiltInResolutionAndFps(key: String) {""",
+    "Persist built-in settings immediately",
+)
+
+svc = replace_once(
+    svc,
+    """        val current = target.settings
+        val width = widthText?.toIntOrNull() ?: current.width""",
+    """        setBuiltInAutoStart(target.key, true)
+        val current = target.settings
+        val width = widthText?.toIntOrNull() ?: current.width""",
+    "Remember web built-in start",
+)
+
+svc = replace_once(
+    svc,
+    """        targets.forEach { camera ->
+            stopBuiltInCamera(camera.key) { updateStatsAndNotificationAsync() }
+        }""",
+    """        targets.forEach { camera ->
+            setBuiltInAutoStart(camera.key, false)
+            stopBuiltInCamera(camera.key) { updateStatsAndNotificationAsync() }
+        }""",
+    "Remember web built-in stop",
+)
+
+svc = replace_once(
+    svc,
+    """    <div class='group'>PHONE CAMERAS</div>
+    ${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 cameras exposed</div>" }}""",
+    """    <div class='group'>PHONE CAMERAS</div>
+    <div style='font-size:10px;color:#7f93a8;margin:0 4px 8px'>Concurrent sets: ${esc(builtInConcurrencySummary())}</div>
+    ${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 cameras exposed</div>" }}""",
+    "Dashboard Camera2 concurrency report",
+)
+
+manifest = replace_once(
+    manifest,
+    '    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />',
+    '    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />\n'
+    '    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />',
+    "Boot permission",
+)
+
+manifest = replace_once(
+    manifest,
+    '            <meta-data android:name="com.oculus.vr.focusaware" android:value="true"/>',
+    '            <intent-filter>\n'
+    '                <action android:name="android.intent.action.MAIN" />\n'
+    '                <category android:name="android.intent.category.HOME" />\n'
+    '                <category android:name="android.intent.category.DEFAULT" />\n'
+    '            </intent-filter>\n\n'
+    '            <meta-data android:name="com.oculus.vr.focusaware" android:value="true"/>',
+    "HOME launcher intent filter",
+)
+
+manifest = replace_once(
+    manifest,
+    '        <activity\n            android:name=".AboutActivity"',
+    '        <receiver\n'
+    '            android:name=".KioskBootReceiver"\n'
+    '            android:enabled="true"\n'
+    '            android:exported="true">\n'
+    '            <intent-filter>\n'
+    '                <action android:name="android.intent.action.BOOT_COMPLETED" />\n'
+    '            </intent-filter>\n'
+    '        </receiver>\n\n'
+    '        <activity\n'
+    '            android:name=".AboutActivity"',
+    "Boot receiver manifest",
+)
+
+boot_receiver_source = r"""package net.d7z.net.oss.uvc
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+
+class KioskBootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
+        runCatching {
+            context.startActivity(
+                Intent(context, MainActivity::class.java).apply {
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    )
+                }
+            )
+        }
+    }
+}
+"""
+
+crash_handler_source = r"""package net.d7z.net.oss.uvc
+
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.SystemClock
+import kotlin.system.exitProcess
+
+object KioskCrashHandler {
+    @Volatile private var installed = false
+
+    fun install(context: Context) {
+        if (installed) return
+        installed = true
+        val appContext = context.applicationContext
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            runCatching {
+                val restartIntent = Intent(appContext, MainActivity::class.java).apply {
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    )
+                }
+                val pending = PendingIntent.getActivity(
+                    appContext,
+                    9001,
+                    restartIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                appContext.getSystemService(AlarmManager::class.java).set(
+                    AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                    SystemClock.elapsedRealtime() + 3000L,
+                    pending
+                )
+            }
+
+            if (previous != null) previous.uncaughtException(thread, error) else exitProcess(10)
+        }
+    }
+}
+"""
+
+boot_receiver_path.write_text(boot_receiver_source, encoding="utf-8")
+crash_handler_path.write_text(crash_handler_source, encoding="utf-8")
+
 # Guard against the exact v3 failure mode: a broad regex deleted roughly 1,500
 # lines from UvcStreamingService.kt. This patch only inserts/replaces small
 # bounded regions, so the patched service must never become shorter.
@@ -1482,8 +1845,12 @@ if svc.count("private fun discoverKlipperBuiltInCameras()") != 1:
 
 main_path.write_text(main, encoding="utf-8")
 svc_path.write_text(svc, encoding="utf-8")
+manifest_path.write_text(manifest, encoding="utf-8")
 
 print("Patched:", main_path)
 print("Patched:", svc_path)
+print("Patched:", manifest_path)
+print("Added:", boot_receiver_path)
+print("Added:", crash_handler_path)
 print("Bundled:", mpegts_path)
-print("Klipper MultiCam v8 built-in MJPEG preview patch applied successfully.")
+print("Klipper MultiCam v9 dedicated-appliance patch applied successfully.")
