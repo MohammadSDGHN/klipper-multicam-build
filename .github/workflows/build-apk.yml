@@ -62,17 +62,64 @@ jobs:
         shell: bash
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
-      - name: Collect APK
+      - name: Select an ARM64-compatible APK
         shell: bash
         run: |
-          APK="$(find AndroidUVC/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
-          test -n "$APK"
-          cp "$APK" KlipperMultiCam.apk
+          set -euo pipefail
+
+          echo "All APKs produced:"
+          find AndroidUVC/app/build/outputs/apk -type f -name '*.apk' -print | sort || true
+          echo
+
+          show_abis() {
+            local apk="$1"
+            echo "---- $apk ----"
+            unzip -l "$apk" | awk '/ lib\// {print $4}' | cut -d/ -f2 | sort -u || true
+          }
+
+          ARM_APK=""
+          while IFS= read -r apk; do
+            show_abis "$apk"
+            if unzip -l "$apk" | grep -q 'lib/arm64-v8a/'; then
+              ARM_APK="$apk"
+              break
+            fi
+          done < <(find AndroidUVC/app/build/outputs/apk -type f -name '*.apk' | sort)
+
+          if [ -z "$ARM_APK" ]; then
+            echo
+            echo "No ARM64 APK found in the normal build."
+            echo "Retrying an ARM64-targeted Gradle build..."
+            (
+              cd AndroidUVC
+              ./gradlew :app:assembleDebug                 -Pandroid.injected.build.abi=arm64-v8a                 --stacktrace --no-daemon
+            )
+
+            while IFS= read -r apk; do
+              show_abis "$apk"
+              if unzip -l "$apk" | grep -q 'lib/arm64-v8a/'; then
+                ARM_APK="$apk"
+                break
+              fi
+            done < <(find AndroidUVC/app/build/outputs/apk -type f -name '*.apk' | sort)
+          fi
+
+          if [ -z "$ARM_APK" ]; then
+            echo
+            echo "ERROR: build completed but no APK contains lib/arm64-v8a/."
+            echo "The S10 SM-G973F requires an ARM ABI for native libraries."
+            exit 1
+          fi
+
+          echo
+          echo "Selected ARM64 APK: $ARM_APK"
+          unzip -l "$ARM_APK" | awk '/ lib\// {print $4}' | head -n 80
+          cp "$ARM_APK" KlipperMultiCam.apk
           ls -lh KlipperMultiCam.apk
 
-      - name: Upload APK
+      - name: Upload ARM64 APK
         uses: actions/upload-artifact@v4
         with:
-          name: KlipperMultiCam-APK
+          name: KlipperMultiCam-ARM64-APK
           path: KlipperMultiCam.apk
           if-no-files-found: error
