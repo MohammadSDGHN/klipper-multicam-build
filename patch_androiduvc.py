@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Klipper MultiCam v3 unified-browser patch for FreeTracker/AndroidUVC.
+Klipper MultiCam v5 active-web-control patch for FreeTracker/AndroidUVC.
 
 Adds:
 - auto-start USB UVC streams
 - browser MJPEG for raw YUYV/NV12 USB webcams
 - all Camera2 IDs exposed by Android, not only first rear/front
 - H.264 preference for built-in phone camera browser playback
-- a single built-in 2x2 Chrome dashboard on port 8080
+- an active 2x2 Chrome dashboard on port 8080 with stream controls
+- browser fallback when a raw YUYV/NV12 hardware encoder cannot start
+- Camera2 resolution/FPS/zoom/focus/exposure/AWB/torch controls
 - bundled mpegts.js (no second Android app)
-- USB snapshot URLs and built-in lens switching from the web page
+- USB snapshots and built-in camera switching from the web page
 """
 
 from pathlib import Path
@@ -222,7 +224,7 @@ svc = replace_once(
 svc = replace_once(
     svc,
     '        if (format != "MJPG") session.isPreviewEnabled = false',
-    '        if (format == "H264" || format == "HEVC") session.isPreviewEnabled = false',
+    '        session.isPreviewEnabled = format in setOf("MJPG", "YUYV", "NV12")',
     "Raw preview enablement",
 )
 svc = replace_once(
@@ -258,6 +260,96 @@ svc = replace_once(
         prefs.edit { putBoolean("filter_builtin_cameras", false) }''',
     "Service built-in default",
 )
+
+
+# ---------------------------------------------------------------------------
+# v5 raw USB fallback. If MediaCodec cannot be allocated for another YUYV/NV12
+# webcam, keep the USB capture alive and serve software MJPEG to Chrome.
+# ---------------------------------------------------------------------------
+svc = replace_once(
+    svc,
+    """        @Volatile
+        var lastBrowserJpegAtMs: Long = 0L
+        var selectedResPos: Int = 0""",
+    """        @Volatile
+        var lastBrowserJpegAtMs: Long = 0L
+        @Volatile
+        var browserRawRunning: Boolean = false
+        var browserRawThread: Thread? = null
+        var selectedResPos: Int = 0""",
+    "Browser-only raw worker fields",
+)
+
+raw_worker_helper = r'''
+    private fun startRawBrowserWorker(session: CameraSession) {
+        if (session.browserRawRunning) return
+        session.browserRawRunning = true
+        session.browserRawThread = Thread {
+            while (session.browserRawRunning && !Thread.currentThread().isInterrupted) {
+                try {
+                    val frame = session.rawFrameQueue.take()
+                    maybePublishBrowserJpeg(session, frame)
+                } catch (_: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    log("Cam ${session.index} browser JPEG worker: ${e.message}")
+                }
+            }
+        }.apply {
+            name = "uvc-browser-jpeg-${session.index}"
+            isDaemon = true
+            start()
+        }
+    }
+
+'''
+svc = replace_once(
+    svc,
+    "    private fun waitForEncodedUvcFrame(session: CameraSession): Boolean {",
+    raw_worker_helper + "    private fun waitForEncodedUvcFrame(session: CameraSession): Boolean {",
+    "Browser-only raw worker helper",
+)
+
+svc = replace_once(
+    svc,
+    "    private fun stopUvcTransport(session: CameraSession) {",
+    """    private fun stopUvcTransport(session: CameraSession) {
+        session.browserRawRunning = false
+        session.browserRawThread?.interrupt()
+        session.browserRawThread = null""",
+    "Stop browser-only raw worker",
+)
+
+raw_block_old = '''            "YUYV", "NV12" -> {
+                val codec = preferredUvcEncodeCodec(width, height, fps) ?: return false
+                val encoder = UvcRawEncoder(session, width, height, fps, codec)
+                if (!encoder.start()) return false
+                session.rawEncoder = encoder
+                session.actualVideoCodec = codec
+                "USB Camera $format -> ${codec.label} RTSP + MJPEG HTTP"
+            }'''
+raw_block_new = '''            "YUYV", "NV12" -> {
+                val codec = preferredUvcEncodeCodec(width, height, fps)
+                if (codec != null) {
+                    val encoder = UvcRawEncoder(session, width, height, fps, codec)
+                    if (encoder.start()) {
+                        session.rawEncoder = encoder
+                        session.actualVideoCodec = codec
+                        "USB Camera $format -> ${codec.label} RTSP + MJPEG HTTP"
+                    } else {
+                        session.actualVideoCodec = null
+                        startRawBrowserWorker(session)
+                        log("Cam ${session.index}: MediaCodec unavailable; browser-only MJPEG fallback.")
+                        "USB Camera $format -> MJPEG HTTP (browser-only)"
+                    }
+                } else {
+                    session.actualVideoCodec = null
+                    startRawBrowserWorker(session)
+                    log("Cam ${session.index}: no compatible encoder; browser-only MJPEG fallback.")
+                    "USB Camera $format -> MJPEG HTTP (browser-only)"
+                }
+            }'''
+svc = replace_once(svc, raw_block_old, raw_block_new, "Raw USB browser fallback branch")
 
 
 # ---------------------------------------------------------------------------
@@ -400,8 +492,28 @@ svc = replace_once(
                 uri == "/uvc" -> html(uvcListPage())''',
     '''                uri == "/" || uri == "/index.html" -> html(rootPage())
                 uri == "/static/mpegts.min.js" -> javascriptAsset("mpegts.min.js")
+                uri == "/api/uvc/start" -> startUvcFromHttp(
+                    session.parameters["index"]?.firstOrNull(),
+                    session.parameters["mode"]?.firstOrNull(),
+                    session.parameters["fps"]?.firstOrNull()
+                )
+                uri == "/api/uvc/stop" -> stopUvcFromHttp(session.parameters["index"]?.firstOrNull())
                 uri == "/api/builtin/select" -> selectBuiltInFromHttp(session.parameters["key"]?.firstOrNull())
-                uri == "/api/builtin/stop" -> stopBuiltInFromHttp()
+                uri == "/api/builtin/start" -> startBuiltInFromHttp(
+                    session.parameters["key"]?.firstOrNull(),
+                    session.parameters["width"]?.firstOrNull(),
+                    session.parameters["height"]?.firstOrNull(),
+                    session.parameters["fps"]?.firstOrNull()
+                )
+                uri == "/api/builtin/settings" -> updateBuiltInFromHttp(
+                    session.parameters["key"]?.firstOrNull(),
+                    session.parameters["zoom"]?.firstOrNull(),
+                    session.parameters["focus"]?.firstOrNull(),
+                    session.parameters["exposure"]?.firstOrNull(),
+                    session.parameters["awb"]?.firstOrNull(),
+                    session.parameters["torch"]?.firstOrNull()
+                )
+                uri == "/api/builtin/stop" -> stopBuiltInFromHttp(session.parameters["key"]?.firstOrNull())
                 uri.startsWith("/snapshot/uvc/") && uri.endsWith(".jpg") -> serveUvcSnapshot(
                     uri.substringAfter("/snapshot/uvc/").removeSuffix(".jpg").toIntOrNull()
                 )
@@ -410,6 +522,169 @@ svc = replace_once(
 )
 
 http_helpers = r'''
+    private data class KlipperUvcOption(
+        val label: String,
+        val format: String,
+        val width: Int,
+        val height: Int,
+        val fpsValues: List<Int>
+    )
+
+    private fun klipperUvcOptions(camera: CameraSession): List<KlipperUvcOption> {
+        val result = mutableListOf<KlipperUvcOption>()
+        camera.supportedFormats.split(";").forEach { rawEntry ->
+            val entry = rawEntry.trim()
+            if (entry.isBlank()) return@forEach
+            val parts = entry.split(":")
+            if (parts.size < 2) return@forEach
+
+            val left = parts[0].trim()
+            val leftParts = left.split("|")
+            val label = if (leftParts.size >= 2) {
+                "${leftParts[0].trim()} ${leftParts[1].trim()}"
+            } else {
+                "MJPG ${left.trim()}"
+            }
+            val format = label.substringBefore(" ").trim().ifBlank { "MJPG" }
+            val resolution = label.substringAfter(" ", "").trim()
+            val width = resolution.substringBefore("x", "").toIntOrNull() ?: return@forEach
+            val height = resolution.substringAfter("x", "").toIntOrNull() ?: return@forEach
+            val fps = parts[1].split(",").mapNotNull { it.trim().toIntOrNull() }.distinct()
+
+            result += KlipperUvcOption(label, format, width, height, fps)
+        }
+        return result
+    }
+
+    private fun plain(
+        text: String,
+        status: NanoHTTPD.Response.Status = NanoHTTPD.Response.Status.OK
+    ): NanoHTTPD.Response {
+        return NanoHTTPD.newFixedLengthResponse(status, NanoHTTPD.MIME_PLAINTEXT, text).apply {
+            addHeader("Cache-Control", "no-store")
+            addHeader("Access-Control-Allow-Origin", "*")
+        }
+    }
+
+    private fun startUvcFromHttp(indexText: String?, mode: String?, fpsText: String?): NanoHTTPD.Response {
+        val index = indexText?.toIntOrNull() ?: return plain(
+            "Missing/invalid USB camera index",
+            NanoHTTPD.Response.Status.BAD_REQUEST
+        )
+        val camera = sessionsByIndex[index] ?: return plain(
+            "USB camera $index not found",
+            NanoHTTPD.Response.Status.NOT_FOUND
+        )
+
+        val options = klipperUvcOptions(camera)
+        val selected = mode?.let { wanted -> options.firstOrNull { it.label == wanted } }
+            ?: options.getOrNull(camera.selectedResPos)
+            ?: options.firstOrNull()
+            ?: return plain("No stream modes reported by USB camera $index", NanoHTTPD.Response.Status.CONFLICT)
+
+        val fps = fpsText?.toIntOrNull()
+            ?: selected.fpsValues.getOrNull(camera.selectedFpsPos)
+            ?: selected.fpsValues.firstOrNull()
+            ?: 10
+
+        camera.selectedResPos = options.indexOf(selected).coerceAtLeast(0)
+        camera.selectedFpsPos = selected.fpsValues.indexOf(fps).let { if (it < 0) 0 else it }
+
+        val startAction = {
+            startStreaming(
+                camera.fd,
+                selected.width,
+                selected.height,
+                fps,
+                selected.format
+            ) { updateStatsAndNotificationAsync() }
+        }
+
+        if (camera.isStreaming) {
+            stopStreaming(camera.fd) { startAction() }
+        } else {
+            startAction()
+        }
+        return plain("Start requested: USB $index ${selected.label} @ ${fps}fps")
+    }
+
+    private fun stopUvcFromHttp(indexText: String?): NanoHTTPD.Response {
+        val index = indexText?.toIntOrNull() ?: return plain(
+            "Missing/invalid USB camera index",
+            NanoHTTPD.Response.Status.BAD_REQUEST
+        )
+        val camera = sessionsByIndex[index] ?: return plain(
+            "USB camera $index not found",
+            NanoHTTPD.Response.Status.NOT_FOUND
+        )
+        stopStreaming(camera.fd) { updateStatsAndNotificationAsync() }
+        return plain("Stop requested: USB $index")
+    }
+
+    private fun startBuiltInFromHttp(
+        key: String?,
+        widthText: String?,
+        heightText: String?,
+        fpsText: String?
+    ): NanoHTTPD.Response {
+        val target = key?.let { builtInSessions[it] } ?: return plain(
+            "Built-in camera not found",
+            NanoHTTPD.Response.Status.NOT_FOUND
+        )
+
+        val current = target.settings
+        val width = widthText?.toIntOrNull() ?: current.width
+        val height = heightText?.toIntOrNull() ?: current.height
+        val fps = fpsText?.toIntOrNull() ?: current.fps
+        updateBuiltInSettings(
+            target.key,
+            current.copy(
+                width = width,
+                height = height,
+                fps = fps,
+                fpsRangeLower = fps,
+                fpsRangeUpper = fps
+            )
+        )
+
+        val startTarget = {
+            startBuiltInCamera(target.key) { updateStatsAndNotificationAsync() }
+        }
+        val other = builtInSessions.values.firstOrNull {
+            it.key != target.key && it.state != SessionState.IDLE
+        }
+        when {
+            target.state != SessionState.IDLE -> stopBuiltInCamera(target.key) { startTarget() }
+            other != null -> stopBuiltInCamera(other.key) { startTarget() }
+            else -> startTarget()
+        }
+        return plain("Start requested: ${target.displayName} ${width}x${height} @ ${fps}fps")
+    }
+
+    private fun updateBuiltInFromHttp(
+        key: String?,
+        zoomText: String?,
+        focusText: String?,
+        exposureText: String?,
+        awbText: String?,
+        torchText: String?
+    ): NanoHTTPD.Response {
+        val target = key?.let { builtInSessions[it] } ?: return plain(
+            "Built-in camera not found",
+            NanoHTTPD.Response.Status.NOT_FOUND
+        )
+        val current = target.settings
+        val next = current.copy(
+            zoomRatio = zoomText?.toFloatOrNull() ?: current.zoomRatio,
+            focusDistance = focusText?.toFloatOrNull() ?: current.focusDistance,
+            exposureCompensation = exposureText?.toIntOrNull() ?: current.exposureCompensation,
+            awbEnabled = awbText?.toBooleanStrictOrNull() ?: current.awbEnabled,
+            torchEnabled = torchText?.toBooleanStrictOrNull() ?: current.torchEnabled
+        )
+        updateBuiltInSettings(target.key, next)
+        return plain("Updated ${target.displayName}")
+    }
+
     private fun javascriptAsset(name: String): NanoHTTPD.Response {
         return try {
             val text = assets.open(name).bufferedReader(Charsets.UTF_8).use { it.readText() }
@@ -424,35 +699,29 @@ http_helpers = r'''
     }
 
     private fun selectBuiltInFromHttp(key: String?): NanoHTTPD.Response {
-        val target = key?.let { builtInSessions[it] } ?: return NanoHTTPD.newFixedLengthResponse(
-            NanoHTTPD.Response.Status.NOT_FOUND,
-            NanoHTTPD.MIME_PLAINTEXT,
-            "Built-in camera not found"
+        val target = key?.let { builtInSessions[it] } ?: return plain(
+            "Built-in camera not found",
+            NanoHTTPD.Response.Status.NOT_FOUND
         )
-        Thread {
-            builtInSessions.values
-                .filter { it.key != target.key && it.state != SessionState.IDLE }
-                .forEach { stopBuiltInCamera(it.key) }
-            if (!target.isStreaming) startBuiltInCamera(target.key)
-        }.start()
-        return NanoHTTPD.newFixedLengthResponse(
-            NanoHTTPD.Response.Status.OK,
-            NanoHTTPD.MIME_PLAINTEXT,
-            "Starting ${target.displayName}"
+        val current = target.settings
+        return startBuiltInFromHttp(
+            target.key,
+            current.width.toString(),
+            current.height.toString(),
+            current.fps.toString()
         )
     }
 
-    private fun stopBuiltInFromHttp(): NanoHTTPD.Response {
-        Thread {
-            builtInSessions.values
-                .filter { it.state != SessionState.IDLE }
-                .forEach { stopBuiltInCamera(it.key) }
-        }.start()
-        return NanoHTTPD.newFixedLengthResponse(
-            NanoHTTPD.Response.Status.OK,
-            NanoHTTPD.MIME_PLAINTEXT,
-            "Stopping built-in camera"
-        )
+    private fun stopBuiltInFromHttp(key: String? = null): NanoHTTPD.Response {
+        val targets = if (key.isNullOrBlank()) {
+            builtInSessions.values.filter { it.state != SessionState.IDLE }
+        } else {
+            listOfNotNull(builtInSessions[key]).filter { it.state != SessionState.IDLE }
+        }
+        targets.forEach { camera ->
+            stopBuiltInCamera(camera.key) { updateStatsAndNotificationAsync() }
+        }
+        return plain(if (key.isNullOrBlank()) "Stopping built-in camera" else "Stopping $key")
     }
 
     private fun serveUvcSnapshot(index: Int?): NanoHTTPD.Response {
@@ -523,21 +792,27 @@ dashboard = r'''    private fun rootPage(): String {
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace("\"", "&quot;")
-            .replace("'", "&#39;")
+
+        fun builtInWebName(camera: BuiltInCameraSession): String {
+            return when (camera.facing) {
+                BuiltInFacing.BACK -> if (camera.displayName.startsWith("Rear")) camera.displayName else "Rear phone camera"
+                BuiltInFacing.FRONT -> if (camera.displayName.startsWith("Front")) camera.displayName else "Front phone camera"
+                BuiltInFacing.UNKNOWN -> camera.displayName
+            }
+        }
 
         val usbSessions = sessionsByIndex.keys().toList().sorted().mapNotNull { sessionsByIndex[it] }
         val builtIns = builtInSessions.values.sortedBy { it.index }
         val activeBuiltIn = builtIns.firstOrNull { it.isStreaming }
+        val selectedBuiltIn = activeBuiltIn ?: builtIns.firstOrNull()
 
         val sidebarUsb = usbSessions.joinToString("") { camera ->
-            val live = if (camera.isStreaming) "LIVE" else "IDLE"
+            val live = if (camera.isStreaming) "LIVE" else "READY"
             val format = currentUvcDisplayFormat(camera)
-            val res = camera.supportedFormats.split(";").filter { it.isNotBlank() }
-                .getOrNull(camera.selectedResPos)?.substringBefore(':')?.substringAfter('|') ?: ""
             """
-            <button class='camera-row' onclick=\"openUrl('/uvc/camera/${camera.index}')\">
+            <button class='camera-row' onclick="document.getElementById('tile-usb-${camera.index}')?.scrollIntoView({behavior:'smooth'})">
               <span><b>USB ${camera.index}</b><small>${esc(camera.device.productName ?: camera.device.deviceName)}</small></span>
-              <span class='right'><i class='${if (camera.isStreaming) "dot live" else "dot"}'></i>$live<small>${esc(format)} ${esc(res)}</small></span>
+              <span class='right'><i class='${if (camera.isStreaming) "dot live" else "dot"}'></i>$live<small>${esc(format)}</small></span>
             </button>
             """.trimIndent()
         }
@@ -547,58 +822,127 @@ dashboard = r'''    private fun rootPage(): String {
             val profile = camera.actualProfile ?: camera.selectedOrFallbackProfile()
             val res = profile?.let { "${it.size.width}x${it.size.height} @ ${builtInFpsLabel(camera)}" }.orEmpty()
             """
-            <button class='camera-row' onclick=\"selectPhoneLens('${esc(camera.key)}')\">
-              <span><b>${esc(camera.displayName)}</b><small>Phone Camera2 · id ${esc(camera.cameraId)}</small></span>
+            <button class='camera-row' onclick="choosePhone('${esc(camera.key)}')">
+              <span><b>${esc(builtInWebName(camera))}</b><small>Camera2 id ${esc(camera.cameraId)}</small></span>
               <span class='right'><i class='${if (camera.isStreaming) "dot live" else "dot"}'></i>$live<small>${esc(res)}</small></span>
             </button>
             """.trimIndent()
         }
 
         val tiles = mutableListOf<String>()
-        usbSessions.filter { it.isStreaming }.take(4).forEach { camera ->
+        usbSessions.take(3).forEach { camera ->
             val format = currentUvcDisplayFormat(camera)
             val canMjpeg = format in setOf("MJPG", "YUYV", "NV12")
-            val media = if (canMjpeg) {
-                "<img crossorigin='anonymous' src='/uvc/camera/${camera.index}.mjpg' alt='USB ${camera.index}'>"
-            } else {
-                "<div class='no-video'>${esc(format)} is RTSP-only</div>"
+            val options = klipperUvcOptions(camera)
+            val selectedOption = options.getOrNull(camera.selectedResPos) ?: options.firstOrNull()
+            val selectedFps = selectedOption?.fpsValues?.getOrNull(camera.selectedFpsPos)
+                ?: selectedOption?.fpsValues?.firstOrNull()
+                ?: 10
+
+            val modeOptions = options.mapIndexed { pos, option ->
+                val fpsData = option.fpsValues.joinToString(",")
+                "<option value='${esc(option.label)}' data-fps='${esc(fpsData)}' ${if (pos == camera.selectedResPos) "selected" else ""}>${esc(option.label)}</option>"
+            }.joinToString("")
+            val fpsOptions = (selectedOption?.fpsValues ?: emptyList()).joinToString("") { fps ->
+                "<option value='$fps' ${if (fps == selectedFps) "selected" else ""}>$fps fps</option>"
             }
-            val direct = if (canMjpeg) "/uvc/camera/${camera.index}.mjpg" else ""
+
+            val media = if (camera.isStreaming && canMjpeg) {
+                "<img crossorigin='anonymous' src='/uvc/camera/${camera.index}.mjpg?t=${System.currentTimeMillis()}' alt='USB ${camera.index}'>"
+            } else if (camera.isStreaming) {
+                "<div class='no-video'>${esc(format)} stream is RTSP-only</div>"
+            } else {
+                "<div class='no-video'>Stream stopped</div>"
+            }
+
             tiles += """
               <section class='tile' id='tile-usb-${camera.index}'>
                 <header><b>USB ${camera.index}</b><span>${esc(camera.device.productName ?: "")}</span></header>
                 <div class='media'>$media</div>
+                <div class='controls'>
+                  <label>Mode<select id='usb-mode-${camera.index}' onchange='refreshUsbFps(${camera.index})'>$modeOptions</select></label>
+                  <label>FPS<select id='usb-fps-${camera.index}'>$fpsOptions</select></label>
+                  <button class='primary' onclick='usbStart(${camera.index})'>${if (camera.isStreaming) "Restart" else "Start"}</button>
+                  <button onclick='usbStop(${camera.index})'>Stop</button>
+                </div>
                 <footer>
-                  <span>${esc(format)}</span>
-                  <button onclick=\"takePhoto('tile-usb-${camera.index}','usb-${camera.index}')\">Photo</button>
-                  ${if (direct.isNotBlank()) "<button onclick=\"openUrl('$direct')\">Open</button>" else ""}
+                  <span>${esc(format)} · ${esc(camera.actualEncoding)}</span>
+                  <button onclick="takePhoto('tile-usb-${camera.index}','usb-${camera.index}')">Photo</button>
+                  ${if (canMjpeg) "<button onclick=\"openUrl('/uvc/camera/${camera.index}.mjpg')\">Open</button>" else ""}
                 </footer>
               </section>
             """.trimIndent()
         }
 
-        if (activeBuiltIn != null && tiles.size < 4) {
-            val profile = activeBuiltIn.actualProfile ?: activeBuiltIn.selectedOrFallbackProfile()
-            val streamUrl = "/builtin/${activeBuiltIn.key}.${profile?.streamExtension ?: "ts"}"
+        if (selectedBuiltIn != null) {
+            val camera = selectedBuiltIn
+            val current = camera.settings
+            val profiles = camera.profiles
+                .distinctBy { "${it.size.width}x${it.size.height}@${it.fps}" }
+                .sortedWith(compareByDescending<BuiltInProfile> { it.size.width * it.size.height }.thenByDescending { it.fps })
+            val profileOptions = profiles.joinToString("") { profile ->
+                val selected = profile.size.width == current.width && profile.size.height == current.height && profile.fps == current.fps
+                "<option value='${profile.size.width},${profile.size.height},${profile.fps}' ${if (selected) "selected" else ""}>${profile.size.width}x${profile.size.height} @ ${profile.fps} fps · ${esc(profile.videoCodec.label)}</option>"
+            }
+            val cameraOptions = builtIns.joinToString("") { item ->
+                "<option value='${esc(item.key)}' ${if (item.key == camera.key) "selected" else ""}>${esc(builtInWebName(item))} · id ${esc(item.cameraId)}</option>"
+            }
+            val streamUrl = if (camera.isStreaming) {
+                val profile = camera.actualProfile ?: camera.selectedOrFallbackProfile()
+                "/builtin/${camera.key}.${profile?.streamExtension ?: "ts"}"
+            } else ""
+            val media = if (camera.isStreaming) {
+                "<video id='phone-video' muted autoplay playsinline controls></video><div id='phone-error' class='player-error'></div>"
+            } else {
+                "<div class='no-video'>Phone camera stopped</div>"
+            }
+            val cap = camera.capabilities
+            val maxZoom = cap.maxZoom.coerceAtLeast(1f)
+            val maxFocus = cap.maxFocusDistance.coerceAtLeast(0f)
+
             tiles += """
-              <section class='tile' id='tile-phone'>
-                <header><b>${esc(activeBuiltIn.displayName)}</b><span>Phone camera</span></header>
-                <div class='media'><video id='phone-video' muted autoplay playsinline controls></video></div>
+              <section class='tile phone-tile' id='tile-phone'>
+                <header><b>${esc(builtInWebName(camera))}</b><span>Phone Camera2 · id ${esc(camera.cameraId)}</span></header>
+                <div class='media'>$media</div>
+                <div class='controls phone-controls'>
+                  <label>Camera<select id='phone-key' onchange='phoneCameraChanged()'>$cameraOptions</select></label>
+                  <label>Resolution / FPS<select id='phone-profile'>$profileOptions</select></label>
+                  <button class='primary' onclick='phoneStart()'>${if (camera.isStreaming) "Restart / Apply" else "Start"}</button>
+                  <button onclick='phoneStop()'>Stop</button>
+
+                  <label class='slider'>Zoom <span id='zoom-val'>${current.zoomRatio}x</span>
+                    <input id='phone-zoom' type='range' min='1' max='$maxZoom' step='0.1' value='${current.zoomRatio}' oninput="document.getElementById('zoom-val').textContent=this.value+'x'" onchange='phoneControls()'>
+                  </label>
+                  <div class='quick'>
+                    <button onclick='setZoom(1)'>1×</button>
+                    ${if (maxZoom >= 2f) "<button onclick='setZoom(2)'>2×</button>" else ""}
+                    ${if (maxZoom >= 4f) "<button onclick='setZoom(4)'>4×</button>" else ""}
+                  </div>
+
+                  ${if (cap.autofocusSupported) """
+                  <label class='slider'>Focus <span id='focus-val'>${current.focusDistance}</span>
+                    <input id='phone-focus' type='range' min='0' max='$maxFocus' step='0.1' value='${current.focusDistance}' oninput="document.getElementById('focus-val').textContent=this.value" onchange='phoneControls()'>
+                  </label>""" else ""}
+
+                  ${if (!cap.exposureCompensationRange.isEmpty()) """
+                  <label class='slider'>Exposure <span id='exp-val'>${current.exposureCompensation}</span>
+                    <input id='phone-exposure' type='range' min='${cap.exposureCompensationRange.first}' max='${cap.exposureCompensationRange.last}' step='1' value='${current.exposureCompensation}' oninput="document.getElementById('exp-val').textContent=this.value" onchange='phoneControls()'>
+                  </label>""" else ""}
+
+                  <label class='check'><input id='phone-awb' type='checkbox' ${if (current.awbEnabled) "checked" else ""} onchange='phoneControls()'> Auto white balance</label>
+                  ${if (cap.torchSupported) "<label class='check'><input id='phone-torch' type='checkbox' ${if (current.torchEnabled) "checked" else ""} onchange='phoneControls()'> Torch</label>" else ""}
+                </div>
                 <footer>
-                  <span>${esc(profile?.videoCodec?.label ?: activeBuiltIn.actualEncoding)}</span>
-                  <button onclick=\"takePhoto('tile-phone','phone')\">Photo</button>
-                  <button onclick=\"openUrl('$streamUrl')\">Open TS</button>
+                  <span>${esc(camera.actualEncoding.ifBlank { "Camera2" })}</span>
+                  <button onclick="takePhoto('tile-phone','phone')">Photo</button>
+                  ${if (streamUrl.isNotBlank()) "<button onclick=\"openUrl('$streamUrl')\">Open TS</button>" else ""}
                 </footer>
               </section>
             """.trimIndent()
         }
 
         while (tiles.size < 4) {
-            tiles += """
-              <section class='tile empty'>
-                <div class='no-video'>Connect/start another camera</div>
-              </section>
-            """.trimIndent()
+            tiles += """<section class='tile empty'><div class='no-video'>Connect/start another camera</div></section>"""
         }
 
         val phonePlayerScript = if (activeBuiltIn != null) {
@@ -616,66 +960,39 @@ dashboard = r'''    private fun rootPage(): String {
 <title>Klipper MultiCam</title>
 <script src='/static/mpegts.min.js'></script>
 <style>
-:root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-*{box-sizing:border-box}
-body{margin:0;background:#0b1015;color:#eef4f8;height:100vh;overflow:hidden}
-.layout{display:grid;grid-template-columns:280px 1fr;height:100vh}
-.sidebar{background:#111922;border-right:1px solid #263342;padding:14px;overflow:auto}
-.brand{font-weight:800;font-size:20px;margin:4px 4px 14px}.brand small{display:block;font-size:11px;font-weight:500;color:#7f93a8;margin-top:3px}
-.group{font-size:11px;color:#7f93a8;font-weight:800;letter-spacing:.12em;margin:16px 4px 7px}
-.camera-row{width:100%;border:1px solid #263342;background:#151f29;color:#eef4f8;padding:10px;border-radius:10px;margin:5px 0;display:flex;justify-content:space-between;text-align:left;gap:8px;cursor:pointer}
-.camera-row:hover{background:#1d2a36}.camera-row span{display:flex;flex-direction:column;gap:2px}.camera-row .right{text-align:right;align-items:flex-end}
-.camera-row small{font-size:10px;color:#91a4b8}.dot{width:7px;height:7px;border-radius:50%;background:#58697b;display:inline-block}.dot.live{background:#29d17d;box-shadow:0 0 8px #29d17d88}
-.main{display:grid;grid-template-rows:auto 1fr;min-width:0}.toolbar{display:flex;gap:10px;align-items:center;padding:12px 16px;background:#111922;border-bottom:1px solid #263342}
-.toolbar h1{font-size:15px;margin:0 auto 0 0}.toolbar button,.tile button{background:#1d2a36;border:1px solid #34465a;color:white;border-radius:8px;padding:7px 10px;cursor:pointer}
-.grid{padding:12px;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:10px;min-height:0}
-.tile{background:#111922;border:1px solid #263342;border-radius:12px;display:grid;grid-template-rows:auto 1fr auto;overflow:hidden;min-height:0}
-.tile header,.tile footer{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#131d27;font-size:12px}.tile header span{color:#8da2b7;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tile footer span{margin-right:auto;color:#8da2b7}
-.media{min-height:0;background:black;display:flex;align-items:center;justify-content:center;overflow:hidden}.media img,.media video{width:100%;height:100%;object-fit:contain;background:black}
-.no-video{color:#72869a;font-size:13px;text-align:center;padding:20px}.empty{opacity:.55}
-@media(max-width:850px){body{overflow:auto}.layout{grid-template-columns:1fr;height:auto}.sidebar{border-right:0;border-bottom:1px solid #263342}.grid{grid-template-columns:1fr;grid-template-rows:repeat(4,320px)}}
+:root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}*{box-sizing:border-box}
+body{margin:0;background:#0b1015;color:#eef4f8;height:100vh;overflow:hidden}.layout{display:grid;grid-template-columns:270px 1fr;height:100vh}
+.sidebar{background:#111922;border-right:1px solid #263342;padding:14px;overflow:auto}.brand{font-weight:800;font-size:20px;margin:4px 4px 14px}.brand small{display:block;font-size:11px;font-weight:500;color:#7f93a8;margin-top:3px}
+.group{font-size:11px;color:#7f93a8;font-weight:800;letter-spacing:.12em;margin:16px 4px 7px}.camera-row{width:100%;border:1px solid #263342;background:#151f29;color:#eef4f8;padding:10px;border-radius:10px;margin:5px 0;display:flex;justify-content:space-between;text-align:left;gap:8px;cursor:pointer}.camera-row:hover{background:#1d2a36}.camera-row span{display:flex;flex-direction:column;gap:2px}.camera-row .right{text-align:right;align-items:flex-end}.camera-row small{font-size:10px;color:#91a4b8}.dot{width:7px;height:7px;border-radius:50%;background:#58697b;display:inline-block}.dot.live{background:#29d17d;box-shadow:0 0 8px #29d17d88}
+.main{display:grid;grid-template-rows:auto 1fr;min-width:0}.toolbar{display:flex;gap:8px;align-items:center;padding:10px 14px;background:#111922;border-bottom:1px solid #263342}.toolbar h1{font-size:15px;margin:0 auto 0 0}.toolbar button,.tile button{background:#1d2a36;border:1px solid #34465a;color:white;border-radius:8px;padding:7px 10px;cursor:pointer}button.primary{background:#0f6654;border-color:#188b72}
+.grid{padding:10px;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:10px;min-height:0}.tile{background:#111922;border:1px solid #263342;border-radius:12px;display:grid;grid-template-rows:auto minmax(120px,1fr) auto auto;overflow:hidden;min-height:0}.tile header,.tile footer{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#131d27;font-size:12px}.tile header span{color:#8da2b7;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tile footer span{margin-right:auto;color:#8da2b7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.media{min-height:0;background:black;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}.media img,.media video{width:100%;height:100%;object-fit:contain;background:black}.controls{padding:7px;background:#101923;border-top:1px solid #263342;display:grid;grid-template-columns:2fr 1fr auto auto;gap:6px;align-items:end}.controls label{font-size:10px;color:#8da2b7;display:flex;flex-direction:column;gap:3px}.controls select,.controls input[type=range]{width:100%;background:#182430;color:#eef4f8;border:1px solid #34465a;border-radius:6px;padding:5px}.phone-controls{grid-template-columns:1fr 1.4fr auto auto}.phone-controls .slider{grid-column:span 2}.phone-controls .quick{display:flex;gap:4px}.phone-controls .check{flex-direction:row;align-items:center;color:#c9d5df}.no-video{color:#72869a;font-size:13px;text-align:center;padding:20px}.empty{opacity:.55}.player-error{position:absolute;left:8px;right:8px;bottom:8px;background:#541f25dd;color:#ffd9dd;padding:6px;border-radius:6px;font-size:11px;display:none}#action-status{font-size:11px;color:#8da2b7;max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:900px){body{overflow:auto}.layout{grid-template-columns:1fr;height:auto}.sidebar{border-right:0;border-bottom:1px solid #263342}.grid{grid-template-columns:1fr;grid-template-rows:none}.tile{min-height:430px}.controls,.phone-controls{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
 <div class='layout'>
-  <aside class='sidebar'>
-    <div class='brand'>Klipper MultiCam<small>One app · USB + phone lenses · Chrome</small></div>
-    <div class='group'>USB CAMERAS</div>
-    ${sidebarUsb.ifBlank { "<div class='no-video'>No USB camera sessions</div>" }}
-    <div class='group'>PHONE LENSES</div>
-    ${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 lenses exposed</div>" }}
-  </aside>
-  <main class='main'>
-    <div class='toolbar'>
-      <h1>Live cameras</h1>
-      <button onclick='location.reload()'>Refresh</button>
-      <button onclick='stopPhone()'>Stop phone camera</button>
-      <button onclick=\"openUrl('/uvc')\">USB details</button>
-      <button onclick=\"openUrl('/builtin')\">Phone details</button>
-    </div>
-    <div class='grid'>${tiles.joinToString("")}</div>
-  </main>
+  <aside class='sidebar'><div class='brand'>Klipper MultiCam<small>One app · full browser control</small></div><div class='group'>USB CAMERAS</div>${sidebarUsb.ifBlank { "<div class='no-video'>No USB camera sessions</div>" }}<div class='group'>PHONE CAMERAS</div>${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 cameras exposed</div>" }}</aside>
+  <main class='main'><div class='toolbar'><h1>Live cameras</h1><span id='action-status'></span><button onclick='startAllUsb()'>Start USB</button><button onclick='stopAllUsb()'>Stop USB</button><button onclick='location.reload()'>Refresh</button></div><div class='grid'>${tiles.joinToString("")}</div></main>
 </div>
 <script>
 var phonePlayer=null;
 function openUrl(u){window.open(u,'_blank')}
-function selectPhoneLens(key){fetch('/api/builtin/select?key='+encodeURIComponent(key),{cache:'no-store'}).then(function(){setTimeout(function(){location.reload()},2200)}).catch(function(e){alert(e)})}
-function stopPhone(){fetch('/api/builtin/stop',{cache:'no-store'}).then(function(){setTimeout(function(){location.reload()},800)})}
-function startPhonePlayer(url){
-  var v=document.getElementById('phone-video'); if(!v){return}
-  if(window.mpegts && mpegts.getFeatureList().mseLivePlayback){
-    phonePlayer=mpegts.createPlayer({type:'mse',isLive:true,url:url},{enableWorker:true,enableWorkerForMSE:true,liveBufferLatencyChasing:true,liveBufferLatencyMaxLatency:2.0,liveBufferLatencyMinRemain:0.3});
-    phonePlayer.attachMediaElement(v); phonePlayer.load(); var p=phonePlayer.play(); if(p&&p.catch){p.catch(function(){})}
-  }else{v.outerHTML="<div class='no-video'>This browser does not expose MSE live playback.</div>"}
-}
-function takePhoto(tileId,name){
-  var tile=document.getElementById(tileId); if(!tile){return}
-  var media=tile.querySelector('video,img'); if(!media){return}
-  var w=media.videoWidth||media.naturalWidth||media.clientWidth; var h=media.videoHeight||media.naturalHeight||media.clientHeight;
-  if(!w||!h){alert('No frame available yet');return}
-  var c=document.createElement('canvas'); c.width=w; c.height=h; c.getContext('2d').drawImage(media,0,0,w,h);
-  c.toBlob(function(blob){if(!blob){return}var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name+'-'+new Date().toISOString().replace(/[:.]/g,'-')+'.jpg';a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1500)},'image/jpeg',0.92)
-}
+function status(t){var e=document.getElementById('action-status');if(e)e.textContent=t||''}
+function action(url,delay){status('Working…');return fetch(url,{cache:'no-store'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t);return t})}).then(function(t){status(t);if(delay!==0)setTimeout(function(){location.reload()},delay||1300);return t}).catch(function(e){status(e.message);alert(e.message);throw e})}
+function refreshUsbFps(i){var m=document.getElementById('usb-mode-'+i),f=document.getElementById('usb-fps-'+i);if(!m||!f)return;var a=(m.options[m.selectedIndex].dataset.fps||'').split(',').filter(Boolean);f.innerHTML='';a.forEach(function(v){var o=document.createElement('option');o.value=v;o.textContent=v+' fps';f.appendChild(o)})}
+function usbStart(i){var m=document.getElementById('usb-mode-'+i),f=document.getElementById('usb-fps-'+i);return action('/api/uvc/start?index='+i+'&mode='+encodeURIComponent(m?m.value:'')+'&fps='+encodeURIComponent(f?f.value:''),1800)}
+function usbStop(i){return action('/api/uvc/stop?index='+i,1000)}
+function startAllUsb(){var ids=[${usbSessions.joinToString(",") { it.index.toString() }}];ids.reduce(function(p,i){return p.then(function(){return fetch('/api/uvc/start?index='+i,{cache:'no-store'})})},Promise.resolve()).then(function(){setTimeout(function(){location.reload()},2200)})}
+function stopAllUsb(){var ids=[${usbSessions.joinToString(",") { it.index.toString() }}];ids.forEach(function(i){fetch('/api/uvc/stop?index='+i,{cache:'no-store'})});setTimeout(function(){location.reload()},1200)}
+function choosePhone(key){var s=document.getElementById('phone-key');if(s){s.value=key;phoneCameraChanged()}else{action('/api/builtin/select?key='+encodeURIComponent(key),2200)}}
+function phoneCameraChanged(){var s=document.getElementById('phone-key');if(s)action('/api/builtin/select?key='+encodeURIComponent(s.value),2200)}
+function phoneStart(){var k=document.getElementById('phone-key'),p=document.getElementById('phone-profile');if(!k||!p)return;var a=p.value.split(',');action('/api/builtin/start?key='+encodeURIComponent(k.value)+'&width='+a[0]+'&height='+a[1]+'&fps='+a[2],2500)}
+function phoneStop(){var k=document.getElementById('phone-key');action('/api/builtin/stop?key='+encodeURIComponent(k?k.value:''),1200)}
+function phoneControls(){var k=document.getElementById('phone-key');if(!k)return;var q=['key='+encodeURIComponent(k.value)];var z=document.getElementById('phone-zoom');if(z)q.push('zoom='+encodeURIComponent(z.value));var f=document.getElementById('phone-focus');if(f)q.push('focus='+encodeURIComponent(f.value));var e=document.getElementById('phone-exposure');if(e)q.push('exposure='+encodeURIComponent(e.value));var a=document.getElementById('phone-awb');if(a)q.push('awb='+a.checked);var t=document.getElementById('phone-torch');if(t)q.push('torch='+t.checked);action('/api/builtin/settings?'+q.join('&'),0)}
+function setZoom(v){var z=document.getElementById('phone-zoom');if(!z)return;z.value=Math.min(parseFloat(z.max),v);z.dispatchEvent(new Event('input'));phoneControls()}
+function startPhonePlayer(url){var v=document.getElementById('phone-video'),err=document.getElementById('phone-error');if(!v)return;if(window.mpegts&&mpegts.getFeatureList().mseLivePlayback){phonePlayer=mpegts.createPlayer({type:'mpegts',isLive:true,hasAudio:false,hasVideo:true,url:url},{enableWorker:true,enableStashBuffer:false,lazyLoad:false,liveBufferLatencyChasing:true,liveBufferLatencyMaxLatency:1.5,liveBufferLatencyMinRemain:0.15});if(mpegts.Events&&mpegts.Events.ERROR){phonePlayer.on(mpegts.Events.ERROR,function(type,detail,info){if(err){err.style.display='block';err.textContent='Player: '+type+' / '+detail+(info?' · '+String(info):'')}})}phonePlayer.attachMediaElement(v);phonePlayer.load();var p=phonePlayer.play();if(p&&p.catch){p.catch(function(e){if(err){err.style.display='block';err.textContent='Play: '+e.message}})}}else if(err){err.style.display='block';err.textContent='Chrome MSE live playback is unavailable.'}}
+function takePhoto(tileId,name){var tile=document.getElementById(tileId);if(!tile)return;var media=tile.querySelector('video,img');if(!media)return;var w=media.videoWidth||media.naturalWidth||media.clientWidth,h=media.videoHeight||media.naturalHeight||media.clientHeight;if(!w||!h){alert('No frame available yet');return}var c=document.createElement('canvas');c.width=w;c.height=h;try{c.getContext('2d').drawImage(media,0,0,w,h)}catch(e){alert('Snapshot failed: '+e.message);return}c.toBlob(function(blob){if(!blob)return;var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name+'-'+new Date().toISOString().replace(/[:.]/g,'-')+'.jpg';a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1500)},'image/jpeg',0.92)}
 $phonePlayerScript
 </script>
 </body>
@@ -734,4 +1051,4 @@ svc_path.write_text(svc, encoding="utf-8")
 print("Patched:", main_path)
 print("Patched:", svc_path)
 print("Bundled:", mpegts_path)
-print("Klipper MultiCam v4 safe unified dashboard patch applied successfully.")
+print("Klipper MultiCam v5 active web-control patch applied successfully.")
