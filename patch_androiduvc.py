@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Klipper MultiCam v9 dedicated-appliance patch for FreeTracker/AndroidUVC.
+Klipper MultiCam v10 dedicated-appliance patch for FreeTracker/AndroidUVC.
 
 Adds:
 - auto-start USB UVC streams
@@ -1083,6 +1083,7 @@ http_helpers = r'''
                 fpsRangeUpper = fps
             )
         )
+        persistBuiltInSettings(target.key)
 
         val startTarget = {
             startBuiltInCamera(target.key) { updateStatsAndNotificationAsync() }
@@ -1119,6 +1120,7 @@ http_helpers = r'''
             torchEnabled = torchText?.toBooleanStrictOrNull() ?: current.torchEnabled
         )
         updateBuiltInSettings(target.key, next)
+        persistBuiltInSettings(target.key)
         return plain("Updated ${target.displayName}")
     }
 
@@ -1677,18 +1679,6 @@ svc = replace_once(
 
 svc = replace_once(
     svc,
-    """        onSessionsChangedListener?.invoke()
-    }
-    fun resetBuiltInResolutionAndFps(key: String) {""",
-    """        persistBuiltInSettings(key)
-        onSessionsChangedListener?.invoke()
-    }
-    fun resetBuiltInResolutionAndFps(key: String) {""",
-    "Persist built-in settings immediately",
-)
-
-svc = replace_once(
-    svc,
     """        val current = target.settings
         val width = widthText?.toIntOrNull() ?: current.width""",
     """        setBuiltInAutoStart(target.key, true)
@@ -1853,4 +1843,4 @@ print("Patched:", manifest_path)
 print("Added:", boot_receiver_path)
 print("Added:", crash_handler_path)
 print("Bundled:", mpegts_path)
-print("Klipper MultiCam v9 dedicated-appliance patch applied successfully.")
+print("Klipper MultiCam v10 dedicated-appliance patch applied successfully.")
