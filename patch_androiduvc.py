@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Klipper MultiCam v10 dedicated-appliance patch for FreeTracker/AndroidUVC.
+Klipper MultiCam v11 dedicated-appliance patch for FreeTracker/AndroidUVC.
 
 Adds:
 - auto-start USB UVC streams
@@ -1699,15 +1699,36 @@ svc = replace_once(
     "Remember web built-in stop",
 )
 
-svc = replace_once(
-    svc,
-    """    <div class='group'>PHONE CAMERAS</div>
-    ${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 cameras exposed</div>" }}""",
-    """    <div class='group'>PHONE CAMERAS</div>
+# The dashboard HTML was compacted by the earlier v8 transformation, so do not
+# depend on one exact whitespace layout when adding the concurrency diagnostic.
+_concurrency_added = False
+
+_dashboard_phone_compact = """<div class='group'>PHONE CAMERAS</div>${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 cameras exposed</div>" }}"""
+if _dashboard_phone_compact in svc:
+    svc = svc.replace(
+        _dashboard_phone_compact,
+        """<div class='group'>PHONE CAMERAS</div><div style='font-size:10px;color:#7f93a8;margin:0 4px 8px'>Concurrent sets: ${esc(builtInConcurrencySummary())}</div>${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 cameras exposed</div>" }}""",
+        1,
+    )
+    _concurrency_added = True
+
+if not _concurrency_added:
+    _dashboard_phone_multiline = """    <div class='group'>PHONE CAMERAS</div>
+    ${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 cameras exposed</div>" }}"""
+    if _dashboard_phone_multiline in svc:
+        svc = svc.replace(
+            _dashboard_phone_multiline,
+            """    <div class='group'>PHONE CAMERAS</div>
     <div style='font-size:10px;color:#7f93a8;margin:0 4px 8px'>Concurrent sets: ${esc(builtInConcurrencySummary())}</div>
     ${sidebarBuiltIn.ifBlank { "<div class='no-video'>No Camera2 cameras exposed</div>" }}""",
-    "Dashboard Camera2 concurrency report",
-)
+            1,
+        )
+        _concurrency_added = True
+
+if not _concurrency_added:
+    # This diagnostic is optional; never fail the whole APK build just because
+    # upstream/dashboard whitespace changed.
+    print("WARNING: could not add Camera2 concurrency text to dashboard; continuing.")
 
 manifest = replace_once(
     manifest,
@@ -1843,4 +1864,4 @@ print("Patched:", manifest_path)
 print("Added:", boot_receiver_path)
 print("Added:", crash_handler_path)
 print("Bundled:", mpegts_path)
-print("Klipper MultiCam v10 dedicated-appliance patch applied successfully.")
+print("Klipper MultiCam v11 dedicated-appliance patch applied successfully.")
