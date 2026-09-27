@@ -28,6 +28,7 @@ for p in (main_path, svc_path):
 
 main = main_path.read_text(encoding="utf-8")
 svc = svc_path.read_text(encoding="utf-8")
+svc_original_line_count = len(svc.splitlines())
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -260,10 +261,23 @@ svc = replace_once(
 
 
 # ---------------------------------------------------------------------------
-# Enumerate all Camera2 IDs and label rear lenses using focal length ordering.
+# Enumerate every openable Camera2 ID WITHOUT replacing AndroidUVC's original
+# discoverBuiltInCameras(). v3 replaced a huge source range and accidentally
+# deleted many helper/server/native methods. v4 leaves upstream code intact,
+# then rebuilds only the builtInSessions map immediately after normal discovery.
 # ---------------------------------------------------------------------------
-discovery_replacement = r'''    private fun discoverBuiltInCameras() {
+extra_discovery = r'''
+    private data class KlipperBuiltInDiscovery(
+        val cameraId: String,
+        val facing: BuiltInFacing,
+        val profiles: List<BuiltInProfile>,
+        val capabilities: BuiltInCapabilities,
+        val focalLengthMm: Float?
+    )
+
+    private fun discoverKlipperBuiltInCameras() {
         if (filterBuiltInCameras) return
+
         val manager = getSystemService(CameraManager::class.java)
         val discovered = manager.cameraIdList
             .sortedWith(compareBy<String> { it.toIntOrNull() ?: Int.MAX_VALUE }.thenBy { it })
@@ -275,87 +289,93 @@ discovery_replacement = r'''    private fun discoverBuiltInCameras() {
                     else -> BuiltInFacing.UNKNOWN
                 }
                 if (facing == BuiltInFacing.UNKNOWN) return@mapNotNull null
+
                 val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                     ?: return@mapNotNull null
                 val profiles = discoverHardwareEncodeProfiles(characteristics, map)
                 if (profiles.isEmpty()) return@mapNotNull null
-                BuiltInDiscovery(
+
+                KlipperBuiltInDiscovery(
                     cameraId = cameraId,
                     facing = facing,
                     profiles = profiles,
                     capabilities = builtInCapabilities(characteristics),
-                    focalLengthMm = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                    focalLengthMm = characteristics
+                        .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                         ?.minOrNull()
                 )
             }
 
-        val rear = discovered.filter { it.facing == BuiltInFacing.BACK }
+        val rear = discovered
+            .filter { it.facing == BuiltInFacing.BACK }
             .sortedBy { it.focalLengthMm ?: Float.MAX_VALUE }
-        val front = discovered.filter { it.facing == BuiltInFacing.FRONT }
+        val front = discovered
+            .filter { it.facing == BuiltInFacing.FRONT }
             .sortedBy { it.focalLengthMm ?: Float.MAX_VALUE }
         val ordered = rear + front
+        if (ordered.isEmpty()) return
+
+        builtInSessions.clear()
 
         ordered.forEachIndexed { index, info ->
-            val key = "camera$index"
-            val position = if (info.facing == BuiltInFacing.BACK) rear.indexOf(info) else front.indexOf(info)
+            val position = if (info.facing == BuiltInFacing.BACK) {
+                rear.indexOf(info)
+            } else {
+                front.indexOf(info)
+            }
             val groupSize = if (info.facing == BuiltInFacing.BACK) rear.size else front.size
-            val displayName = builtInLensDisplayName(info, position, groupSize)
+            val focal = info.focalLengthMm?.let { " ${it}mm" }.orEmpty()
+            val label = when (info.facing) {
+                BuiltInFacing.BACK -> when {
+                    groupSize >= 3 && position == 0 -> "Rear Ultra-wide$focal"
+                    groupSize >= 3 && position == groupSize - 1 -> "Rear Tele$focal"
+                    groupSize >= 3 -> "Rear Wide$focal"
+                    groupSize == 2 -> "Rear Lens ${position + 1}$focal"
+                    else -> "Rear Camera$focal"
+                }
+                BuiltInFacing.FRONT -> if (groupSize > 1) {
+                    "Front Camera ${position + 1}$focal"
+                } else {
+                    "Front Camera$focal"
+                }
+                BuiltInFacing.UNKNOWN -> "Camera ${index + 1}$focal"
+            }
 
-            val newSession = BuiltInCameraSession(
+            val key = "camera$index"
+            val session = BuiltInCameraSession(
                 key = key,
                 index = index,
-                displayName = displayName,
+                displayName = label,
                 cameraId = info.cameraId,
                 facing = info.facing,
                 profiles = info.profiles,
                 capabilities = info.capabilities
             )
-            if (builtInSessions.putIfAbsent(key, newSession) == null) {
-                restoreBuiltInSettings(newSession)
-            }
+            builtInSessions[key] = session
+            restoreBuiltInSettings(session)
         }
-        log("Built-in cameras discovered: ${builtInSessions.values.sortedBy { it.index }.joinToString { \"${it.key}=${it.displayName}[id=${it.cameraId}]\" }}")
+
+        val summary = builtInSessions.values
+            .sortedBy { it.index }
+            .joinToString { item -> item.key + "=" + item.displayName + "[id=" + item.cameraId + "]" }
+        log("Klipper built-in cameras: $summary")
     }
 
-    private fun builtInLensDisplayName(info: BuiltInDiscovery, position: Int, groupSize: Int): String {
-        val focal = info.focalLengthMm?.let { String.format(Locale.US, " %.2fmm", it) }.orEmpty()
-        return when (info.facing) {
-            BuiltInFacing.BACK -> {
-                val label = when {
-                    groupSize >= 3 && position == 0 -> "Rear Ultra-wide"
-                    groupSize >= 3 && position == groupSize - 1 -> "Rear Tele"
-                    groupSize >= 3 -> "Rear Wide"
-                    groupSize == 2 -> "Rear Lens ${position + 1}"
-                    else -> "Rear Camera"
-                }
-                "$label$focal"
-            }
-            BuiltInFacing.FRONT -> if (groupSize > 1) "Front Camera ${position + 1}$focal" else "Front Camera$focal"
-            BuiltInFacing.UNKNOWN -> "Camera ${position + 1}$focal"
-        }
-    }
-
-    private data class BuiltInDiscovery(
-        val cameraId: String,
-        val facing: BuiltInFacing,
-        val profiles: List<BuiltInProfile>,
-        val capabilities: BuiltInCapabilities,
-        val focalLengthMm: Float?
-    )
 '''
-svc = regex_once(
+svc = replace_once(
     svc,
-    r'''    private fun discoverBuiltInCameras\(\) \{.*?
-    private data class BuiltInDiscovery\(
-        val cameraId: String,
-        val facing: BuiltInFacing,
-        val profiles: List<BuiltInProfile>,
-        val capabilities: BuiltInCapabilities
-    \)
-''',
-    discovery_replacement,
-    "All Camera2 lens discovery",
+    "    private fun discoverBuiltInCameras() {",
+    extra_discovery + "    private fun discoverBuiltInCameras() {",
+    "Safe extra Camera2 discovery insertion",
 )
+
+call_pattern = r'(?m)^(\s*)discoverBuiltInCameras\(\)\s*$'
+def _add_klipper_discovery(match):
+    indent = match.group(1)
+    return indent + "discoverBuiltInCameras()\n" + indent + "discoverKlipperBuiltInCameras()"
+svc, call_count = re.subn(call_pattern, _add_klipper_discovery, svc, count=1)
+if call_count != 1:
+    raise SystemExit(f"Camera2 discovery call: expected exactly one call site, found {call_count}")
 
 svc = regex_once(
     svc,
@@ -693,10 +713,25 @@ else:
         block += "\n        private const val BROWSER_MJPEG_MAX_FPS = 10\n        private const val BROWSER_JPEG_QUALITY = 78"
     svc = svc[:match.start()] + block + match.group(2) + svc[match.end():]
 
+# Guard against the exact v3 failure mode: a broad regex deleted roughly 1,500
+# lines from UvcStreamingService.kt. This patch only inserts/replaces small
+# bounded regions, so the patched service must never become shorter.
+svc_patched_line_count = len(svc.splitlines())
+if svc_patched_line_count < svc_original_line_count:
+    raise SystemExit(
+        f"Source integrity check failed: service shrank from {svc_original_line_count} "
+        f"to {svc_patched_line_count} lines"
+    )
+
+if svc.count("private fun discoverBuiltInCameras()") != 1:
+    raise SystemExit("Source integrity check failed: discoverBuiltInCameras count changed")
+if svc.count("private fun discoverKlipperBuiltInCameras()") != 1:
+    raise SystemExit("Source integrity check failed: Klipper discovery method missing/duplicated")
+
 main_path.write_text(main, encoding="utf-8")
 svc_path.write_text(svc, encoding="utf-8")
 
 print("Patched:", main_path)
 print("Patched:", svc_path)
 print("Bundled:", mpegts_path)
-print("Klipper MultiCam v3 unified dashboard patch applied successfully.")
+print("Klipper MultiCam v4 safe unified dashboard patch applied successfully.")
