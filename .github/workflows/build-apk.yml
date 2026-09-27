@@ -1,0 +1,72 @@
+name: Build Klipper MultiCam APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout build wrapper
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream AndroidUVC
+        uses: actions/checkout@v4
+        with:
+          repository: FreeTracker/AndroidUVC
+          ref: main
+          path: AndroidUVC
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Install common Android build packages
+        shell: bash
+        run: |
+          sdkmanager             "platform-tools"             "platforms;android-36"             "build-tools;36.0.0"             "cmake;3.22.1"             "ndk;28.2.13676358" || true
+
+      - name: Apply Klipper MultiCam patch
+        run: python3 patch_androiduvc.py AndroidUVC
+
+      - name: Enable Gradle SDK auto-download
+        shell: bash
+        run: |
+          echo "android.builder.sdkDownload=true" >> AndroidUVC/gradle.properties
+          chmod +x AndroidUVC/gradlew
+
+      - name: Build debug APK
+        working-directory: AndroidUVC
+        shell: bash
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          APK="$(find AndroidUVC/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" KlipperMultiCam.apk
+          ls -lh KlipperMultiCam.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: KlipperMultiCam-APK
+          path: KlipperMultiCam.apk
+          if-no-files-found: error
