@@ -882,7 +882,7 @@ dashboard = r'''    private fun rootPage(): String {
                 .sortedWith(compareByDescending<BuiltInProfile> { it.size.width * it.size.height }.thenByDescending { it.fps })
             val profileOptions = profiles.joinToString("") { profile ->
                 val selected = profile.size.width == current.width && profile.size.height == current.height && profile.fps == current.fps
-                "<option value='${profile.size.width},${profile.size.height},${profile.fps}' ${if (selected) "selected" else ""}>${profile.size.width}x${profile.size.height} @ ${profile.fps} fps · ${esc(profile.videoCodec.label)}</option>"
+                "<option value='${profile.size.width},${profile.size.height},${profile.fps}' ${if (selected) "selected" else ""}>${profile.size.width}x${profile.size.height} @ ${profile.fps} fps · ${esc(profile.videoCodec?.label ?: "H.264")}</option>"
             }
             val cameraOptions = builtIns.joinToString("") { item ->
                 "<option value='${esc(item.key)}' ${if (item.key == camera.key) "selected" else ""}>${esc(builtInWebName(item))} · id ${esc(item.cameraId)}</option>"
@@ -1051,4 +1051,4 @@ svc_path.write_text(svc, encoding="utf-8")
 print("Patched:", main_path)
 print("Patched:", svc_path)
 print("Bundled:", mpegts_path)
-print("Klipper MultiCam v5 active web-control patch applied successfully.")
+print("Klipper MultiCam v6 active web-control patch applied successfully.")
