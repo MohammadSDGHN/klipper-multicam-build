@@ -38,7 +38,10 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           test -d "$ANDROID_HOME"
-          ls -la "$ANDROID_HOME"
+          echo "Installed platforms:"
+          ls -1 "$ANDROID_HOME/platforms" 2>/dev/null || true
+          echo "Installed build-tools:"
+          ls -1 "$ANDROID_HOME/build-tools" 2>/dev/null || true
           echo "Installed NDKs:"
           ls -1 "$ANDROID_HOME/ndk" 2>/dev/null || true
           echo "Installed CMake:"
@@ -47,10 +50,11 @@ jobs:
       - name: Apply Klipper MultiCam patch
         run: python3 patch_androiduvc.py AndroidUVC
 
-      - name: Allow Gradle to use/download SDK components if required
+      - name: Enable Gradle SDK auto-download safely
         shell: bash
         run: |
-          echo "android.builder.sdkDownload=true" >> AndroidUVC/gradle.properties
+          printf '\nandroid.builder.sdkDownload=true\n' >> AndroidUVC/gradle.properties
+          tail -n 5 AndroidUVC/gradle.properties
           chmod +x AndroidUVC/gradlew
 
       - name: Build APK
