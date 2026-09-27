@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Klipper MultiCam v7 stability + scrolling patch for FreeTracker/AndroidUVC.
+Klipper MultiCam v8 built-in MJPEG preview + stability patch for FreeTracker/AndroidUVC.
 
 Adds:
 - auto-start USB UVC streams
@@ -430,6 +430,358 @@ svc = replace_once(
             addHeader("Access-Control-Allow-Origin", "*")
         }""",
     "Built-in HTTP MPEG-TS chunked streaming",
+)
+
+
+# ---------------------------------------------------------------------------
+# v8 built-in browser preview:
+# Chrome's MPEG-TS/MSE path is unreliable on this phone/build even though the
+# Camera2 + H.264 encoder itself is running. Add a separate low-bandwidth
+# YUV_420_888 ImageReader output for regular Camera2 profiles, convert a few
+# frames per second to JPEG, and expose it as ordinary MJPEG.
+# ---------------------------------------------------------------------------
+
+svc = replace_once(
+    svc,
+    "import android.media.MediaCodec\nimport android.media.MediaCodecInfo",
+    "import android.media.Image\nimport android.media.ImageReader\nimport android.media.MediaCodec\nimport android.media.MediaCodecInfo",
+    "Built-in browser preview media imports",
+)
+
+svc = replace_once(
+    svc,
+    """        val encodedVideoHub = EncodedVideoHub()
+        val frameCount = AtomicLong(0)""",
+    """        val encodedVideoHub = EncodedVideoHub()
+        val browserPreviewFrameHub = MjpegFrameHub()
+        val frameCount = AtomicLong(0)""",
+    "Built-in browser preview frame hub",
+)
+
+svc = replace_once(
+    svc,
+    """        var highSpeedPreviewTexture: SurfaceTexture? = null
+        var highSpeedPreviewSurface: Surface? = null
+        var tsMuxer: MpegTsMuxer? = null""",
+    """        var highSpeedPreviewTexture: SurfaceTexture? = null
+        var highSpeedPreviewSurface: Surface? = null
+        var browserPreviewReader: ImageReader? = null
+        var browserPreviewThread: HandlerThread? = null
+        var browserPreviewHandler: Handler? = null
+        @Volatile
+        var lastBrowserPreviewJpegAtMs: Long = 0L
+        var tsMuxer: MpegTsMuxer? = null""",
+    "Built-in browser preview session fields",
+)
+
+
+built_in_preview_helpers = r"""
+    private fun chooseBuiltInBrowserPreviewSize(
+        session: BuiltInCameraSession,
+        profile: BuiltInProfile
+    ): Size? {
+        val map = runCatching {
+            getSystemService(CameraManager::class.java)
+                .getCameraCharacteristics(session.cameraId)
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        }.getOrNull() ?: return null
+
+        val sizes = map.getOutputSizes(ImageFormat.YUV_420_888)
+            .orEmpty()
+            .toList()
+            .filter { it.width >= 320 && it.height >= 240 }
+
+        if (sizes.isEmpty()) return null
+
+        val targetRatio = profile.size.width.toDouble() / profile.size.height.toDouble()
+        val targetArea = if (targetRatio > 1.55) 640L * 360L else 640L * 480L
+        val bounded = sizes.filter { it.width <= 960 && it.height <= 720 }
+        val pool = if (bounded.isNotEmpty()) bounded else sizes
+
+        return pool.minByOrNull { size ->
+            val ratio = size.width.toDouble() / size.height.toDouble()
+            val ratioPenalty =
+                (kotlin.math.abs(ratio - targetRatio) * 1_000_000_000.0).toLong()
+            val areaPenalty =
+                kotlin.math.abs(size.width.toLong() * size.height.toLong() - targetArea)
+            ratioPenalty + areaPenalty
+        }
+    }
+
+    private fun yuv420888ToNv21(image: Image): ByteArray? {
+        if (image.format != ImageFormat.YUV_420_888) return null
+        val crop = image.cropRect
+        val width = crop.width()
+        val height = crop.height()
+        if (width <= 0 || height <= 0 || width % 2 != 0 || height % 2 != 0) return null
+
+        val planes = image.planes
+        if (planes.size < 3) return null
+
+        return runCatching {
+            val output = ByteArray(width * height * 3 / 2)
+            var out = 0
+
+            val y = planes[0]
+            val yBuffer = y.buffer.duplicate()
+            for (row in 0 until height) {
+                val rowBase = (row + crop.top) * y.rowStride + crop.left * y.pixelStride
+                for (col in 0 until width) {
+                    output[out++] = yBuffer.get(rowBase + col * y.pixelStride)
+                }
+            }
+
+            val u = planes[1]
+            val v = planes[2]
+            val uBuffer = u.buffer.duplicate()
+            val vBuffer = v.buffer.duplicate()
+            val chromaTop = crop.top / 2
+            val chromaLeft = crop.left / 2
+
+            for (row in 0 until height / 2) {
+                val uRowBase =
+                    (row + chromaTop) * u.rowStride + chromaLeft * u.pixelStride
+                val vRowBase =
+                    (row + chromaTop) * v.rowStride + chromaLeft * v.pixelStride
+                for (col in 0 until width / 2) {
+                    output[out++] = vBuffer.get(vRowBase + col * v.pixelStride)
+                    output[out++] = uBuffer.get(uRowBase + col * u.pixelStride)
+                }
+            }
+            output
+        }.getOrNull()
+    }
+
+    private fun builtInImageToJpeg(image: Image): ByteArray? {
+        val nv21 = yuv420888ToNv21(image) ?: return null
+        return runCatching {
+            val width = image.cropRect.width()
+            val height = image.cropRect.height()
+            val output = ByteArrayOutputStream()
+            val ok = YuvImage(
+                nv21,
+                ImageFormat.NV21,
+                width,
+                height,
+                null
+            ).compressToJpeg(
+                Rect(0, 0, width, height),
+                BUILT_IN_BROWSER_JPEG_QUALITY,
+                output
+            )
+            if (!ok) null else output.toByteArray()
+        }.getOrNull()
+    }
+
+    private fun closeBuiltInBrowserPreview(session: BuiltInCameraSession) {
+        runCatching { session.browserPreviewReader?.setOnImageAvailableListener(null, null) }
+        runCatching { session.browserPreviewReader?.close() }
+        session.browserPreviewReader = null
+        session.browserPreviewHandler = null
+        session.browserPreviewThread?.quitSafely()
+        session.browserPreviewThread = null
+        session.lastBrowserPreviewJpegAtMs = 0L
+    }
+
+    private fun createBuiltInBrowserPreview(
+        session: BuiltInCameraSession,
+        profile: BuiltInProfile
+    ): Surface? {
+        if (profile.constrainedHighSpeed) return null
+        val previewSize = chooseBuiltInBrowserPreviewSize(session, profile) ?: return null
+
+        return try {
+            val thread = HandlerThread("builtin-browser-${session.key}").apply { start() }
+            val handler = Handler(thread.looper)
+            val reader = ImageReader.newInstance(
+                previewSize.width,
+                previewSize.height,
+                ImageFormat.YUV_420_888,
+                2
+            )
+
+            session.browserPreviewThread = thread
+            session.browserPreviewHandler = handler
+            session.browserPreviewReader = reader
+
+            reader.setOnImageAvailableListener({ source ->
+                val image = runCatching { source.acquireLatestImage() }.getOrNull()
+                if (image != null) {
+                    try {
+                        val now = SystemClock.elapsedRealtime()
+                        val intervalMs =
+                            1000L / BUILT_IN_BROWSER_MJPEG_MAX_FPS.coerceAtLeast(1)
+                        if (now - session.lastBrowserPreviewJpegAtMs >= intervalMs) {
+                            val jpeg = builtInImageToJpeg(image)
+                            if (jpeg != null && jpeg.isNotEmpty()) {
+                                session.lastBrowserPreviewJpegAtMs = now
+                                session.browserPreviewFrameHub.publish(jpeg)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (session.isStreaming) {
+                            log(
+                                "Built-in ${session.displayName} browser JPEG failed: " +
+                                    "${e.message}"
+                            )
+                        }
+                    } finally {
+                        runCatching { image.close() }
+                    }
+                }
+            }, handler)
+
+            log(
+                "Built-in ${session.displayName} browser MJPEG preview: " +
+                    "${previewSize.width}x${previewSize.height} @ " +
+                    "<=${BUILT_IN_BROWSER_MJPEG_MAX_FPS}fps"
+            )
+            reader.surface
+        } catch (e: Exception) {
+            log("Built-in ${session.displayName} browser preview setup failed: ${e.message}")
+            closeBuiltInBrowserPreview(session)
+            null
+        }
+    }
+
+"""
+
+svc = replace_once(
+    svc,
+    """    @SuppressLint("MissingPermission")
+    private fun openBuiltInCamera(""",
+    built_in_preview_helpers + """    @SuppressLint("MissingPermission")
+    private fun openBuiltInCamera(""",
+    "Built-in MJPEG preview helpers",
+)
+
+
+svc = replace_once(
+    svc,
+    """            val previewTexture = SurfaceTexture(0).apply {
+                setDefaultBufferSize(profile.size.width, profile.size.height)
+            }
+            val previewSurface = Surface(previewTexture)
+            codec.start()
+            session.videoCodec = codec
+            session.codecInputSurface = surface
+            session.highSpeedPreviewTexture = previewTexture
+            session.highSpeedPreviewSurface = previewSurface
+            session.tsMuxer = MpegTsMuxer(activeVideoCodec)
+            listOf(previewSurface, surface)""",
+    """            val browserPreviewSurface =
+                if (profile.constrainedHighSpeed) null
+                else createBuiltInBrowserPreview(session, profile)
+            val previewTexture = if (browserPreviewSurface == null) {
+                SurfaceTexture(0).apply {
+                    setDefaultBufferSize(profile.size.width, profile.size.height)
+                }
+            } else {
+                null
+            }
+            val previewSurface = previewTexture?.let { Surface(it) }
+            codec.start()
+            session.videoCodec = codec
+            session.codecInputSurface = surface
+            session.highSpeedPreviewTexture = previewTexture
+            session.highSpeedPreviewSurface = previewSurface
+            session.tsMuxer = MpegTsMuxer(activeVideoCodec)
+            listOfNotNull(browserPreviewSurface, previewSurface, surface)""",
+    "Built-in Camera2 output surfaces",
+)
+
+svc = replace_once(
+    svc,
+    """            session.highSpeedPreviewTexture = null
+            codec.release()""",
+    """            session.highSpeedPreviewTexture = null
+            closeBuiltInBrowserPreview(session)
+            codec.release()""",
+    "Built-in preview cleanup on encoder setup failure",
+)
+
+svc = replace_once(
+    svc,
+    """            val surfaces = listOfNotNull(session.highSpeedPreviewSurface, session.codecInputSurface)""",
+    """            val surfaces = listOfNotNull(
+                session.browserPreviewReader?.surface,
+                session.highSpeedPreviewSurface,
+                session.codecInputSurface
+            )""",
+    "Built-in repeating request preview surface",
+)
+
+svc = replace_once(
+    svc,
+    """        session.tsMuxer = null
+        session.captureSession = null""",
+    """        closeBuiltInBrowserPreview(session)
+        session.tsMuxer = null
+        session.captureSession = null""",
+    "Built-in browser preview shutdown",
+)
+
+svc = replace_once(
+    svc,
+    """                uri == "/builtin" -> html(builtInListPage())
+                uri.startsWith("/builtin/") && uri.endsWith(".ts") -> serveBuiltInStream(""",
+    """                uri == "/builtin" -> html(builtInListPage())
+                uri.startsWith("/builtin/") && uri.endsWith(".mjpg") -> serveBuiltInMjpeg(
+                    uri.substringAfter("/builtin/").removeSuffix(".mjpg")
+                )
+                uri.startsWith("/builtin/") && uri.endsWith(".ts") -> serveBuiltInStream(""",
+    "Built-in MJPEG HTTP route",
+)
+
+built_in_mjpeg_serve = r"""
+    private fun serveBuiltInMjpeg(key: String): NanoHTTPD.Response {
+        val session = builtInSessions[key] ?: return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.NOT_FOUND,
+            NanoHTTPD.MIME_PLAINTEXT,
+            "Built-in camera not found"
+        )
+        if (!session.isStreaming) return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.CONFLICT,
+            NanoHTTPD.MIME_PLAINTEXT,
+            "Built-in camera is not streaming"
+        )
+        if (session.browserPreviewReader == null) return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.CONFLICT,
+            NanoHTTPD.MIME_PLAINTEXT,
+            "Browser MJPEG preview unavailable for this profile. " +
+                "Select a regular 30 fps profile."
+        )
+        return NanoHTTPD.newChunkedResponse(
+            NanoHTTPD.Response.Status.OK,
+            "multipart/x-mixed-replace; boundary=$BOUNDARY",
+            MjpegInputStream(session.browserPreviewFrameHub) { session.isStreaming }
+        ).apply {
+            addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+            addHeader("Pragma", "no-cache")
+            addHeader("Access-Control-Allow-Origin", "*")
+        }
+    }
+
+"""
+
+svc = replace_once(
+    svc,
+    "    private fun serveBuiltInStream(key: String): NanoHTTPD.Response {",
+    built_in_mjpeg_serve + "    private fun serveBuiltInStream(key: String): NanoHTTPD.Response {",
+    "Built-in MJPEG stream helper",
+)
+
+svc = replace_once(
+    svc,
+    """                val snapshot = frameHub.awaitNextFrame(lastReadFrameId, 1000) ?: return -1""",
+    """                val snapshot = run {
+                    var next: FrameSnapshot? = null
+                    while (next == null && isActive() && !isClosed) {
+                        next = frameHub.awaitNextFrame(lastReadFrameId, 1000)
+                    }
+                    next
+                } ?: return -1""",
+    "Keep MJPEG HTTP connection alive while waiting for frames",
 )
 
 # ---------------------------------------------------------------------------
@@ -957,9 +1309,14 @@ dashboard = r'''    private fun rootPage(): String {
         if (selectedBuiltIn != null) {
             val camera = selectedBuiltIn
             val current = camera.settings
-            val profiles = camera.profiles
+            val browserProfiles =
+                camera.profiles.filter { !it.constrainedHighSpeed }.ifEmpty { camera.profiles }
+            val profiles = browserProfiles
                 .distinctBy { "${it.size.width}x${it.size.height}@${it.fps}" }
-                .sortedWith(compareByDescending<BuiltInProfile> { it.size.width * it.size.height }.thenByDescending { it.fps })
+                .sortedWith(
+                    compareByDescending<BuiltInProfile> { it.size.width * it.size.height }
+                        .thenByDescending { it.fps }
+                )
             val profileOptions = profiles.joinToString("") { profile ->
                 val selected = profile.size.width == current.width && profile.size.height == current.height && profile.fps == current.fps
                 "<option value='${profile.size.width},${profile.size.height},${profile.fps}' ${if (selected) "selected" else ""}>${profile.size.width}x${profile.size.height} @ ${profile.fps} fps · ${esc(profile.videoCodec?.label ?: "H.264")}</option>"
@@ -971,8 +1328,10 @@ dashboard = r'''    private fun rootPage(): String {
                 val profile = camera.actualProfile ?: camera.selectedOrFallbackProfile()
                 "/builtin/${camera.key}.${profile?.streamExtension ?: "ts"}"
             } else ""
-            val media = if (camera.isStreaming) {
-                "<video id='phone-video' muted autoplay playsinline controls></video><div id='phone-error' class='player-error'></div>"
+            val media = if (camera.isStreaming && camera.browserPreviewReader != null) {
+                "<img crossorigin='anonymous' src='/builtin/${camera.key}.mjpg?ts=${System.currentTimeMillis()}' alt='${esc(builtInWebName(camera))}'>"
+            } else if (camera.isStreaming) {
+                "<div class='no-video'>Camera is live, but MJPEG browser preview is unavailable for this profile. Choose a regular 30 fps profile and Restart / Apply.</div>"
             } else {
                 "<div class='no-video'>Phone camera stopped</div>"
             }
@@ -1025,11 +1384,7 @@ dashboard = r'''    private fun rootPage(): String {
             tiles += """<section class='tile empty'><div class='no-video'>Connect/start another camera</div></section>"""
         }
 
-        val phonePlayerScript = if (activeBuiltIn != null) {
-            val profile = activeBuiltIn.actualProfile ?: activeBuiltIn.selectedOrFallbackProfile()
-            val streamUrl = "/builtin/${activeBuiltIn.key}.${profile?.streamExtension ?: "ts"}"
-            "startPhonePlayer('$streamUrl');"
-        } else ""
+        val phonePlayerScript = ""
 
         return """
 <!doctype html>
@@ -1097,7 +1452,7 @@ if const_anchor in svc:
     svc = replace_once(
         svc,
         const_anchor,
-        const_anchor + "\n        private const val BROWSER_MJPEG_MAX_FPS = 10\n        private const val BROWSER_JPEG_QUALITY = 78",
+        const_anchor + "\n        private const val BROWSER_MJPEG_MAX_FPS = 10\n        private const val BROWSER_JPEG_QUALITY = 78\n        private const val BUILT_IN_BROWSER_MJPEG_MAX_FPS = 10\n        private const val BUILT_IN_BROWSER_JPEG_QUALITY = 78",
         "Browser JPEG constants",
     )
 else:
@@ -1131,4 +1486,4 @@ svc_path.write_text(svc, encoding="utf-8")
 print("Patched:", main_path)
 print("Patched:", svc_path)
 print("Bundled:", mpegts_path)
-print("Klipper MultiCam v7 crash/scroll/stream patch applied successfully.")
+print("Klipper MultiCam v8 built-in MJPEG preview patch applied successfully.")
