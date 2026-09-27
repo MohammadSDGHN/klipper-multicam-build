@@ -3,55 +3,57 @@ name: Build Klipper MultiCam APK
 on:
   workflow_dispatch:
   push:
-    branches: [ "main", "master" ]
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
 
     steps:
       - name: Checkout build wrapper
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Checkout upstream AndroidUVC
-        uses: actions/checkout@v4
+      - name: Checkout AndroidUVC source
+        uses: actions/checkout@v5
         with:
           repository: FreeTracker/AndroidUVC
           ref: main
           path: AndroidUVC
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+          cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: yes | sdkmanager --licenses >/dev/null || true
-
-      - name: Install common Android build packages
+      - name: Show preinstalled Android SDK
         shell: bash
         run: |
-          sdkmanager             "platform-tools"             "platforms;android-36"             "build-tools;36.0.0"             "cmake;3.22.1"             "ndk;28.2.13676358" || true
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          test -d "$ANDROID_HOME"
+          ls -la "$ANDROID_HOME"
+          echo "Installed NDKs:"
+          ls -1 "$ANDROID_HOME/ndk" 2>/dev/null || true
+          echo "Installed CMake:"
+          ls -1 "$ANDROID_HOME/cmake" 2>/dev/null || true
 
       - name: Apply Klipper MultiCam patch
         run: python3 patch_androiduvc.py AndroidUVC
 
-      - name: Enable Gradle SDK auto-download
+      - name: Allow Gradle to use/download SDK components if required
         shell: bash
         run: |
           echo "android.builder.sdkDownload=true" >> AndroidUVC/gradle.properties
           chmod +x AndroidUVC/gradlew
 
-      - name: Build debug APK
+      - name: Build APK
         working-directory: AndroidUVC
         shell: bash
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
