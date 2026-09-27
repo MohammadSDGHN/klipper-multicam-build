@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Klipper MultiCam v5 active-web-control patch for FreeTracker/AndroidUVC.
+Klipper MultiCam v7 stability + scrolling patch for FreeTracker/AndroidUVC.
 
 Adds:
 - auto-start USB UVC streams
@@ -351,6 +351,86 @@ raw_block_new = '''            "YUYV", "NV12" -> {
             }'''
 svc = replace_once(svc, raw_block_old, raw_block_new, "Raw USB browser fallback branch")
 
+
+
+# ---------------------------------------------------------------------------
+# v7 stability:
+# 1) MediaCodec can deliver a final async output callback while stop() is
+#    already in progress.  The upstream callback released the output buffer
+#    unconditionally from finally{}, which can throw IllegalStateException and
+#    kill the whole app.  Make BOTH encoder paths tolerant of that stop race.
+# 2) Ask Camera2 to stop/abort repeating work before closing the session.
+# 3) Serve the live built-in MPEG-TS stream as HTTP chunked transfer instead of
+#    a "fixed length" response with length -1.  This is friendlier to browser
+#    streaming/XHR clients such as mpegts.js.
+# ---------------------------------------------------------------------------
+svc = replace_once(
+    svc,
+    """                } finally {
+                    encoder.releaseOutputBuffer(outputIndex, false)
+                }""",
+    """                } finally {
+                    runCatching { encoder.releaseOutputBuffer(outputIndex, false) }
+                        .onFailure {
+                            if (running) {
+                                log("Cam ${session.index} output release skipped: ${it.message}")
+                            }
+                        }
+                }""",
+    "Raw UVC MediaCodec stop-race guard",
+)
+
+svc = replace_once(
+    svc,
+    """                } finally {
+                    codec.releaseOutputBuffer(index, false)
+                }""",
+    """                } finally {
+                    runCatching { codec.releaseOutputBuffer(index, false) }
+                        .onFailure {
+                            if (session.state != SessionState.STOPPING &&
+                                session.state != SessionState.RELEASING &&
+                                session.state != SessionState.IDLE
+                            ) {
+                                log("Built-in ${session.displayName} output release skipped: ${it.message}")
+                            }
+                        }
+                }""",
+    "Built-in MediaCodec stop-race guard",
+)
+
+svc = replace_once(
+    svc,
+    """    private fun closeBuiltInSession(session: BuiltInCameraSession) {
+        try {
+            session.captureSession?.close()""",
+    """    private fun closeBuiltInSession(session: BuiltInCameraSession) {
+        runCatching { session.captureSession?.stopRepeating() }
+        runCatching { session.captureSession?.abortCaptures() }
+        try {
+            session.captureSession?.close()""",
+    "Camera2 orderly stop before close",
+)
+
+svc = replace_once(
+    svc,
+    """        return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.OK,
+            profile.streamMimeType,
+            MpegTsInputStream(session.encodedVideoHub) { session.isStreaming },
+            -1
+        )""",
+    """        return NanoHTTPD.newChunkedResponse(
+            NanoHTTPD.Response.Status.OK,
+            profile.streamMimeType,
+            MpegTsInputStream(session.encodedVideoHub) { session.isStreaming }
+        ).apply {
+            addHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+            addHeader("Pragma", "no-cache")
+            addHeader("Access-Control-Allow-Origin", "*")
+        }""",
+    "Built-in HTTP MPEG-TS chunked streaming",
+)
 
 # ---------------------------------------------------------------------------
 # Enumerate every openable Camera2 ID WITHOUT replacing AndroidUVC's original
@@ -961,13 +1041,13 @@ dashboard = r'''    private fun rootPage(): String {
 <script src='/static/mpegts.min.js'></script>
 <style>
 :root{color-scheme:dark;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}*{box-sizing:border-box}
-body{margin:0;background:#0b1015;color:#eef4f8;height:100vh;overflow:hidden}.layout{display:grid;grid-template-columns:270px 1fr;height:100vh}
-.sidebar{background:#111922;border-right:1px solid #263342;padding:14px;overflow:auto}.brand{font-weight:800;font-size:20px;margin:4px 4px 14px}.brand small{display:block;font-size:11px;font-weight:500;color:#7f93a8;margin-top:3px}
+body{margin:0;background:#0b1015;color:#eef4f8;min-height:100vh;overflow:auto}.layout{display:grid;grid-template-columns:270px minmax(0,1fr);min-height:100vh;align-items:start}
+.sidebar{background:#111922;border-right:1px solid #263342;padding:14px;overflow:auto;position:sticky;top:0;height:100vh}.brand{font-weight:800;font-size:20px;margin:4px 4px 14px}.brand small{display:block;font-size:11px;font-weight:500;color:#7f93a8;margin-top:3px}
 .group{font-size:11px;color:#7f93a8;font-weight:800;letter-spacing:.12em;margin:16px 4px 7px}.camera-row{width:100%;border:1px solid #263342;background:#151f29;color:#eef4f8;padding:10px;border-radius:10px;margin:5px 0;display:flex;justify-content:space-between;text-align:left;gap:8px;cursor:pointer}.camera-row:hover{background:#1d2a36}.camera-row span{display:flex;flex-direction:column;gap:2px}.camera-row .right{text-align:right;align-items:flex-end}.camera-row small{font-size:10px;color:#91a4b8}.dot{width:7px;height:7px;border-radius:50%;background:#58697b;display:inline-block}.dot.live{background:#29d17d;box-shadow:0 0 8px #29d17d88}
-.main{display:grid;grid-template-rows:auto 1fr;min-width:0}.toolbar{display:flex;gap:8px;align-items:center;padding:10px 14px;background:#111922;border-bottom:1px solid #263342}.toolbar h1{font-size:15px;margin:0 auto 0 0}.toolbar button,.tile button{background:#1d2a36;border:1px solid #34465a;color:white;border-radius:8px;padding:7px 10px;cursor:pointer}button.primary{background:#0f6654;border-color:#188b72}
-.grid{padding:10px;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:10px;min-height:0}.tile{background:#111922;border:1px solid #263342;border-radius:12px;display:grid;grid-template-rows:auto minmax(120px,1fr) auto auto;overflow:hidden;min-height:0}.tile header,.tile footer{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#131d27;font-size:12px}.tile header span{color:#8da2b7;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tile footer span{margin-right:auto;color:#8da2b7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.main{display:block;min-width:0}.toolbar{display:flex;gap:8px;align-items:center;padding:10px 14px;background:#111922;border-bottom:1px solid #263342}.toolbar h1{font-size:15px;margin:0 auto 0 0}.toolbar button,.tile button{background:#1d2a36;border:1px solid #34465a;color:white;border-radius:8px;padding:7px 10px;cursor:pointer}button.primary{background:#0f6654;border-color:#188b72}
+.grid{padding:10px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-rows:minmax(440px,auto);gap:10px;align-items:stretch}.tile{background:#111922;border:1px solid #263342;border-radius:12px;display:grid;grid-template-rows:auto minmax(120px,1fr) auto auto;overflow:hidden;min-height:0}.tile header,.tile footer{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#131d27;font-size:12px}.tile header span{color:#8da2b7;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tile footer span{margin-right:auto;color:#8da2b7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .media{min-height:0;background:black;display:flex;align-items:center;justify-content:center;overflow:hidden;position:relative}.media img,.media video{width:100%;height:100%;object-fit:contain;background:black}.controls{padding:7px;background:#101923;border-top:1px solid #263342;display:grid;grid-template-columns:2fr 1fr auto auto;gap:6px;align-items:end}.controls label{font-size:10px;color:#8da2b7;display:flex;flex-direction:column;gap:3px}.controls select,.controls input[type=range]{width:100%;background:#182430;color:#eef4f8;border:1px solid #34465a;border-radius:6px;padding:5px}.phone-controls{grid-template-columns:1fr 1.4fr auto auto}.phone-controls .slider{grid-column:span 2}.phone-controls .quick{display:flex;gap:4px}.phone-controls .check{flex-direction:row;align-items:center;color:#c9d5df}.no-video{color:#72869a;font-size:13px;text-align:center;padding:20px}.empty{opacity:.55}.player-error{position:absolute;left:8px;right:8px;bottom:8px;background:#541f25dd;color:#ffd9dd;padding:6px;border-radius:6px;font-size:11px;display:none}#action-status{font-size:11px;color:#8da2b7;max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-@media(max-width:900px){body{overflow:auto}.layout{grid-template-columns:1fr;height:auto}.sidebar{border-right:0;border-bottom:1px solid #263342}.grid{grid-template-columns:1fr;grid-template-rows:none}.tile{min-height:430px}.controls,.phone-controls{grid-template-columns:1fr 1fr}}
+@media(max-width:900px){.layout{grid-template-columns:1fr}.sidebar{position:static;height:auto;border-right:0;border-bottom:1px solid #263342}.grid{grid-template-columns:1fr;grid-auto-rows:minmax(430px,auto)}.tile{min-height:430px}.controls,.phone-controls{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
@@ -1051,4 +1131,4 @@ svc_path.write_text(svc, encoding="utf-8")
 print("Patched:", main_path)
 print("Patched:", svc_path)
 print("Bundled:", mpegts_path)
-print("Klipper MultiCam v6 active web-control patch applied successfully.")
+print("Klipper MultiCam v7 crash/scroll/stream patch applied successfully.")
